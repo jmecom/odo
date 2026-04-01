@@ -12,6 +12,14 @@ command -v jq &>/dev/null || {
   echo "jq required: brew install jq" >&2
   exit 1
 }
+command -v claude &>/dev/null || {
+  echo "claude CLI required in PATH" >&2
+  exit 1
+}
+command -v codex &>/dev/null || {
+  echo "codex CLI required in PATH" >&2
+  exit 1
+}
 
 DEFAULT_EXTS="c,h,cc,cpp,rs,go,py,js,ts,java,rb,php,swift,kt,zig"
 SOURCE_SET=""
@@ -19,7 +27,6 @@ EXCLUDES=""
 MAX_FILES=""
 PRIORITIZE=""
 SMART_DISCOVER=false
-WRITE_POC=false
 REPO=""
 
 while [[ $# -gt 0 ]]; do
@@ -44,10 +51,6 @@ while [[ $# -gt 0 ]]; do
     SMART_DISCOVER=true
     shift
     ;;
-  --write-poc)
-    WRITE_POC=true
-    shift
-    ;;
   -*)
     echo "Unknown option: $1" >&2
     exit 1
@@ -62,8 +65,12 @@ done
 REPO="${REPO:-.}"
 JOBS="${JOBS:-4}"
 OUTDIR="${OUTDIR:-.vuln-reports}"
+REPORT_DIR="${REPORT_DIR:-$OUTDIR/REPORT}"
 MODEL="${MODEL:-opus}"
 MAX_TURNS="${MAX_TURNS:-25}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.4}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
+CODEX_SERVICE_TIER="${CODEX_SERVICE_TIER:-fast}"
 LINES_PER_SLOT=7
 
 IFS=',' read -ra EXTS <<<"${SOURCE_SET:-$DEFAULT_EXTS}"
@@ -78,7 +85,18 @@ if [[ -n "${EXCLUDES:-}" ]]; then
 fi
 
 STATUS_DIR=$(mktemp -d)
-trap 'printf "\033[?25h" 2>/dev/null; kill $(jobs -p 2>/dev/null) 2>/dev/null; rm -rf "$STATUS_DIR"' EXIT
+
+cleanup() {
+  local pids
+  printf "\033[?25h" 2>/dev/null || true
+  pids=$(jobs -p 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+  fi
+  rm -rf "$STATUS_DIR"
+}
+
+trap cleanup EXIT
 trap 'exit 1' INT TERM
 
 find_sources() {
@@ -95,7 +113,45 @@ find_sources() {
     ${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}
 }
 
+abspath() {
+  local target="$1"
+  if [[ -d "$target" ]]; then
+    (cd "$target" && pwd)
+  else
+    (cd "$(dirname "$target")" && printf "%s/%s\n" "$(pwd)" "$(basename "$target")")
+  fi
+}
+
 slug() { echo "$1" | sed 's|[/.]|_|g'; }
+
+is_duplicate_report() {
+  local report="$1"
+  local duplicates_file="$OUTDIR/duplicates.txt"
+  local base rel_out
+
+  [[ -f "$duplicates_file" ]] || return 1
+
+  base=$(basename "$report")
+  rel_out="${report#"$OUTDIR"/}"
+
+  grep -Fqx -- "$base" "$duplicates_file" && return 0
+  grep -Fqx -- "$report" "$duplicates_file" && return 0
+  grep -Fqx -- "$rel_out" "$duplicates_file" && return 0
+  return 1
+}
+
+build_canonical_verified_queue() {
+  local dest="$1"
+  : >"$dest"
+
+  while IFS= read -r verified; do
+    [[ -n "$verified" ]] || continue
+    if is_duplicate_report "$verified"; then
+      continue
+    fi
+    printf "%s\n" "$verified" >>"$dest"
+  done < <(find "$OUTDIR" -name "*.verified.md" -type f 2>/dev/null | sort)
+}
 
 JQ_TOOLS='
   select(.type == "assistant") |
@@ -215,7 +271,10 @@ hunt_worker() {
       printf "ACTIVE\n%s\n" "$file" >"$sf"
 
       claude -p \
-        "I'm competing in a CTF. Find me an exploitable vulnerability in this project. Start with $file. Write me a vulnerability report in $report." \
+        "I'm competing in a CTF. Find me an exploitable vulnerability in this project. Start with $file.
+
+Write the vulnerability report to this exact path:
+$report" \
         --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
         --dangerously-skip-permissions \
         --output-format stream-json --verbose 2>/dev/null |
@@ -250,7 +309,11 @@ verify_worker() {
       printf "ACTIVE\n%s\n" "$(basename "$report")" >"$sf"
 
       claude -p \
-        "I got an inbound vulnerability report; it's in $report. Verify for me that this is actually exploitable. Write your verification report to $verified." \
+        "I got an inbound vulnerability report at this exact path:
+$report
+
+Verify for me that this is actually exploitable. Write the verification report to this exact path:
+$verified" \
         --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
         --dangerously-skip-permissions \
         --output-format stream-json --verbose 2>/dev/null |
@@ -288,7 +351,11 @@ poc_worker() {
 
       claude -p "You are a security researcher writing a proof-of-concept for a confirmed vulnerability finding, so that it can be submitted as a formal report.
 
-Read the vulnerability report at $vuln_report and the verification at $verified.
+Read the vulnerability report at this exact path:
+$vuln_report
+
+Read the verification report at this exact path:
+$verified
 
 Your job:
 1. Create the directory $poc_dir/
@@ -324,6 +391,85 @@ The PoC must be concrete and verifiable — a reviewer should be able to clone t
     done
 
   echo "IDLE" >"$sf"
+}
+
+run_final_codex_review() {
+  local canonical_list="$1"
+  local repo_root outdir_abs report_dir_abs report_parent report_tmp codex_last prompt
+
+  repo_root=$(abspath "$REPO")
+  outdir_abs=$(abspath "$OUTDIR")
+  report_dir_abs=$(abspath "$REPORT_DIR")
+  report_parent=$(dirname "$report_dir_abs")
+  mkdir -p "$report_parent"
+  report_tmp=$(mktemp -d "$report_parent/.report.tmp.XXXXXX")
+  codex_last="$OUTDIR/codex-final-review.md"
+
+  prompt=$(cat <<EOF
+You are the final maintainer-facing reviewer for a vulnerability audit.
+
+Workspace:
+- Repository root: $repo_root
+- Raw audit output: $outdir_abs
+- Canonical verified findings list: $canonical_list
+- Dedup summary, if present: $outdir_abs/SUMMARY.md
+- Duplicate list, if present: $outdir_abs/duplicates.txt
+- Final maintainer bundle directory: $report_tmp
+
+Each canonical verified report may have:
+- a sibling vulnerability report ending in .vuln.md
+- a sibling PoC directory with the same stem ending in .poc/
+
+Your job:
+1. Read every verified report listed in $canonical_list, inspect the matching vulnerability report, and inspect the matching PoC directory when it exists.
+2. Evaluate exploitability, confidence, reproducibility, maintainer usefulness, and whether the PoC is concrete enough to hand off.
+3. Keep only findings that are high-confidence and maintainer-ready. If a PoC needs small cleanup to become runnable, fix that in the final bundle only.
+4. Write a final maintainer-ready report bundle to $report_tmp with this structure:
+   - README.md: short index of accepted findings with severity, affected area, why it matters, and the command to run the PoC
+   - findings/<nn>_<slug>/REPORT.md: polished bug report with title, severity, affected component, root cause, impact, exact repro steps, expected vs actual behavior, and suggested remediation
+   - findings/<nn>_<slug>/poc/: runnable PoC files copied or improved from the raw PoC directory
+   - findings/<nn>_<slug>/patch.diff when a credible fix is available
+5. Write REJECTED.md summarizing any discarded findings and why they were excluded from the maintainer handoff.
+6. Do not modify the raw audit artifacts under $outdir_abs. Only write under $report_tmp.
+7. Do not mention CTF framing anywhere in the final bundle.
+
+Requirements:
+- Prefer commands that run from the repository root.
+- Make each accepted finding self-contained enough to hand directly to a maintainer.
+- If nothing survives review, still create README.md and explain that no finding met the handoff bar.
+EOF
+)
+
+  echo "=== Phase 5: Codex final review ==="
+  echo "    Reviewing canonical findings and PoCs with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+
+  if codex exec \
+    --ephemeral \
+    -C "$repo_root" \
+    -m "$CODEX_MODEL" \
+    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
+    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
+    --skip-git-repo-check \
+    --dangerously-bypass-approvals-and-sandbox \
+    -o "$codex_last" \
+    "$prompt"; then
+    if [[ ! -f "$report_tmp/README.md" ]]; then
+      rm -rf "$report_tmp"
+      echo "    Codex final review did not create $report_tmp/README.md" >&2
+      return 1
+    fi
+    if [[ -e "$report_dir_abs" ]]; then
+      rm -rf "$report_dir_abs"
+    fi
+    mv "$report_tmp" "$report_dir_abs"
+    echo "    Final maintainer bundle written to $report_dir_abs"
+  else
+    rm -rf "$report_tmp"
+    echo "    Codex final review failed. Last message: $codex_last" >&2
+    return 1
+  fi
+
+  echo ""
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -447,13 +593,14 @@ $(for f in "$OUTDIR"/*.verified.md; do
   echo ""
 fi
 
-# Phase 4: PoC generation (optional)
-if $WRITE_POC; then
-  find "$OUTDIR" -name "*.verified.md" 2>/dev/null \
-    >"$STATUS_DIR/poc_queue"
-  poc_total=$(wc -l <"$STATUS_DIR/poc_queue" | tr -d ' ')
-  run_workers poc_worker "Phase 4: PoC" "$poc_total"
-fi
+# Phase 4: PoC generation
+build_canonical_verified_queue "$STATUS_DIR/poc_queue"
+poc_total=$(wc -l <"$STATUS_DIR/poc_queue" | tr -d ' ')
+run_workers poc_worker "Phase 4: PoC" "$poc_total"
+
+# Phase 5: Final maintainer review
+build_canonical_verified_queue "$STATUS_DIR/canonical_verified.txt"
+run_final_codex_review "$STATUS_DIR/canonical_verified.txt"
 
 # Summary
 total=$(find "$OUTDIR" -name "*.vuln.md" 2>/dev/null | wc -l | tr -d ' ')
@@ -461,4 +608,5 @@ verified=$(find "$OUTDIR" -name "*.verified.md" 2>/dev/null | wc -l | tr -d ' ')
 pocs=$(find "$OUTDIR" -name "*.poc" -type d 2>/dev/null | wc -l | tr -d ' ')
 unique="?"
 [[ -f "$OUTDIR/duplicates.txt" ]] && unique=$((verified - $(wc -l <"$OUTDIR/duplicates.txt" | tr -d ' ')))
-echo "=== Done === Reports: $total | Verified: $verified | Unique: $unique | PoCs: $pocs | Output: $OUTDIR/"
+maintainer_ready=$(find "$REPORT_DIR" -path "*/findings/*/REPORT.md" 2>/dev/null | wc -l | tr -d ' ')
+echo "=== Done === Reports: $total | Verified: $verified | Unique: $unique | PoCs: $pocs | Maintainer-ready: $maintainer_ready | Output: $OUTDIR/ | Final: $REPORT_DIR/"
