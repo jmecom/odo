@@ -472,6 +472,94 @@ EOF
   echo ""
 }
 
+run_final_exploitability_review() {
+  local repo_root outdir_abs report_dir_abs report_parent report_tmp codex_last prompt
+
+  repo_root=$(abspath "$REPO")
+  outdir_abs=$(abspath "$OUTDIR")
+  report_dir_abs=$(abspath "$REPORT_DIR")
+  report_parent=$(dirname "$report_dir_abs")
+
+  [[ -d "$report_dir_abs" ]] || {
+    echo "    Final maintainer bundle not found at $report_dir_abs" >&2
+    return 1
+  }
+
+  mkdir -p "$report_parent"
+  report_tmp=$(mktemp -d "$report_parent/.exploitability.tmp.XXXXXX")
+  codex_last="$OUTDIR/codex-exploitability-review.md"
+
+  cp -R "$report_dir_abs"/. "$report_tmp"/
+
+  read -r -d '' prompt <<EOF || true
+You are the final exploitability and severity reviewer for a maintainer-facing vulnerability bundle.
+
+Workspace:
+- Repository root: $repo_root
+- Raw audit output: $outdir_abs
+- Maintainer bundle to revise in place: $report_tmp
+
+Goal:
+Assume the underlying bugs are legitimate unless the existing bundle itself shows otherwise. Your task is to pressure-test whether the stated severity or impact is overstated, then lock down a realistic exploitability story.
+
+Your job:
+1. Read README.md, REJECTED.md if present, every findings/*/REPORT.md, and each sibling poc/ directory under $report_tmp.
+2. For each accepted finding, determine the most credible exploitation story. Think in concrete scenarios, not generic worst-case language:
+   - who the attacker is
+   - what access or capabilities they need
+   - what inputs or deployment conditions are required
+   - what they can reliably achieve if exploitation succeeds
+   - what limits, mitigations, or operational assumptions reduce impact
+3. Challenge the current severity. If the stated severity is too high for the realistic scenario, lower it. If the severity is only justified under specific assumptions, state those assumptions explicitly.
+4. Update each REPORT.md in place so it includes:
+   - severity with clear rationale
+   - exploitability story / realistic attack scenarios
+   - attacker capabilities and preconditions
+   - constraints, limiting factors, and likely mitigations
+   - impact language that matches what the code path and PoC actually support
+5. Update README.md so each finding's severity and "why it matters" summary matches the revised exploitability story.
+6. If a finding remains valid but only supports a lower-severity impact, keep it in the bundle and rewrite it rather than rejecting it.
+7. If you cannot articulate any credible exploitation story from the available evidence, do not preserve inflated language. Downgrade the finding aggressively and explain the uncertainty in the report.
+8. Do not modify raw audit artifacts under $outdir_abs. Only edit files under $report_tmp.
+9. Do not mention CTF framing anywhere.
+
+Requirements:
+- Prefer realistic, maintainer-useful threat models over maximalist attacker assumptions.
+- Use the PoC and the underlying code as anchors for impact claims.
+- Keep reports concise but specific enough that a maintainer can understand when the bug is actually exploitable.
+- Ensure the bundle remains self-contained and README.md still exists when you finish.
+EOF
+
+  echo "=== Phase 6: Codex exploitability review ==="
+  echo "    Pressure-testing severity and exploitability stories with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+
+  if codex exec \
+    --ephemeral \
+    -C "$repo_root" \
+    -m "$CODEX_MODEL" \
+    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
+    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
+    --skip-git-repo-check \
+    --dangerously-bypass-approvals-and-sandbox \
+    -o "$codex_last" \
+    "$prompt"; then
+    if [[ ! -f "$report_tmp/README.md" ]]; then
+      rm -rf "$report_tmp"
+      echo "    Codex exploitability review did not preserve $report_tmp/README.md" >&2
+      return 1
+    fi
+    rm -rf "$report_dir_abs"
+    mv "$report_tmp" "$report_dir_abs"
+    echo "    Final maintainer bundle updated with exploitability review at $report_dir_abs"
+  else
+    rm -rf "$report_tmp"
+    echo "    Codex exploitability review failed. Last message: $codex_last" >&2
+    return 1
+  fi
+
+  echo ""
+}
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 # Phase 0: Smart discovery (optional)
@@ -601,6 +689,9 @@ run_workers poc_worker "Phase 4: PoC" "$poc_total"
 # Phase 5: Final maintainer review
 build_canonical_verified_queue "$STATUS_DIR/canonical_verified.txt"
 run_final_codex_review "$STATUS_DIR/canonical_verified.txt"
+
+# Phase 6: Final exploitability sanity review
+run_final_exploitability_review
 
 # Summary
 total=$(find "$OUTDIR" -name "*.vuln.md" 2>/dev/null | wc -l | tr -d ' ')
