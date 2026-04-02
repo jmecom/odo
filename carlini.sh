@@ -26,7 +26,6 @@ SOURCE_SET=""
 EXCLUDES=""
 MAX_FILES=""
 PRIORITIZE=""
-SMART_DISCOVER=false
 REPO=""
 
 while [[ $# -gt 0 ]]; do
@@ -46,10 +45,6 @@ while [[ $# -gt 0 ]]; do
   --prioritize)
     PRIORITIZE="$2"
     shift 2
-    ;;
-  --smart-discover-files)
-    SMART_DISCOVER=true
-    shift
     ;;
   -*)
     echo "Unknown option: $1" >&2
@@ -111,6 +106,31 @@ find_sources() {
     -not -path '*/build/*' \
     -not -path '*/.vuln-reports/*' \
     ${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}
+}
+
+build_standard_hunt_queue() {
+  if [[ -n "$PRIORITIZE" ]]; then
+    local prio_arg
+    local -a _prio_exts
+    IFS=',' read -ra _prio_exts <<<"$PRIORITIZE"
+    prio_arg=$(printf '%s\n' "${_prio_exts[@]}" | awk '{printf "%d %s ", NR, $0}')
+    find_sources |
+      awk -v plist="$prio_arg" 'BEGIN {
+          srand(); n=split(plist,a," ")
+          for(i=1;i<=n;i+=2) p[a[i+1]]=a[i]
+        } {
+          ext=$0; sub(/.*\./,"",ext)
+          prio = (ext in p) ? p[ext] : 999
+          printf "%03d\t%f\t%s\n", prio, rand(), $0
+        }' |
+      sort -t$'\t' -k1,1n -k2,2n | cut -f3- |
+      if [[ -n "$MAX_FILES" ]]; then head -"$MAX_FILES"; else cat; fi \
+        >"$STATUS_DIR/hunt_queue"
+  else
+    find_sources | awk 'BEGIN{srand()}{print rand()"\t"$0}' | sort -n | cut -f2- |
+      if [[ -n "$MAX_FILES" ]]; then head -"$MAX_FILES"; else cat; fi \
+        >"$STATUS_DIR/hunt_queue"
+  fi
 }
 
 abspath() {
@@ -562,15 +582,14 @@ EOF
 
 # ── Main ─────────────────────────────────────────────────────────────
 
-# Phase 0: Smart discovery (optional)
-if $SMART_DISCOVER; then
-  echo "=== Phase 0: Smart file discovery ==="
-  echo "    Asking Claude to identify high-value attack surface files..."
+# Phase 0: Smart discovery
+echo "=== Phase 0: Smart file discovery ==="
+echo "    Asking Claude to identify high-value attack surface files..."
 
-  find_sources >"$STATUS_DIR/all_sources"
-  src_count=$(wc -l <"$STATUS_DIR/all_sources" | tr -d ' ')
+find_sources >"$STATUS_DIR/all_sources"
+src_count=$(wc -l <"$STATUS_DIR/all_sources" | tr -d ' ')
 
-  DISCOVER_PROMPT="You are a security researcher doing a vulnerability audit of this codebase.
+DISCOVER_PROMPT="You are a security researcher doing a vulnerability audit of this codebase.
 
 Here is a list of all $src_count source files in the project:
 
@@ -586,50 +605,33 @@ Identify the files most likely to contain exploitable vulnerabilities. Prioritiz
 
 Output ONLY a newline-separated list of file paths, most promising first. No commentary, no markdown, no numbering. Just paths, one per line."
 
-  claude -p "$DISCOVER_PROMPT" \
-    --model "$MODEL" --effort max --max-turns 10 \
-    --dangerously-skip-permissions \
-    2>/dev/null |
-    sed 's/^[[:space:]]*//' |
-    sed 's/^```.*//; s/^- //; s/^[0-9]*[.)] //' |
-    grep -E '^\./|^[a-zA-Z]' |
-    while IFS= read -r f; do
-      [[ -f "$f" ]] && echo "$f"
-    done \
-      >"$STATUS_DIR/hunt_queue.raw" || true
+claude -p "$DISCOVER_PROMPT" \
+  --model "$MODEL" --effort max --max-turns 10 \
+  --dangerously-skip-permissions \
+  2>/dev/null |
+  sed 's/^[[:space:]]*//' |
+  sed 's/^```.*//; s/^- //; s/^[0-9]*[.)] //' |
+  grep -E '^\./|^[a-zA-Z]' |
+  while IFS= read -r f; do
+    [[ -f "$f" ]] && echo "$f"
+  done \
+  | awk '!seen[$0]++' \
+    >"$STATUS_DIR/hunt_queue.raw" || true
 
-  discovered=$(wc -l <"$STATUS_DIR/hunt_queue.raw" | tr -d ' ')
-  echo "    Claude selected $discovered/$src_count files"
+discovered=$(wc -l <"$STATUS_DIR/hunt_queue.raw" | tr -d ' ')
+echo "    Claude selected $discovered/$src_count files"
 
+if [[ "$discovered" -gt 0 ]]; then
   if [[ -n "$MAX_FILES" ]]; then
     head -"$MAX_FILES" "$STATUS_DIR/hunt_queue.raw" >"$STATUS_DIR/hunt_queue"
   else
     cp "$STATUS_DIR/hunt_queue.raw" "$STATUS_DIR/hunt_queue"
   fi
-  echo ""
 else
-  # Standard queue: prioritize or shuffle
-  if [[ -n "$PRIORITIZE" ]]; then
-    IFS=',' read -ra _prio_exts <<<"$PRIORITIZE"
-    prio_arg=$(printf '%s\n' "${_prio_exts[@]}" | awk '{printf "%d %s ", NR, $0}')
-    find_sources |
-      awk -v plist="$prio_arg" 'BEGIN {
-          srand(); n=split(plist,a," ")
-          for(i=1;i<=n;i+=2) p[a[i+1]]=a[i]
-        } {
-          ext=$0; sub(/.*\./,"",ext)
-          prio = (ext in p) ? p[ext] : 999
-          printf "%03d\t%f\t%s\n", prio, rand(), $0
-        }' |
-      sort -t$'\t' -k1,1n -k2,2n | cut -f3- |
-      if [[ -n "$MAX_FILES" ]]; then head -"$MAX_FILES"; else cat; fi \
-        >"$STATUS_DIR/hunt_queue"
-  else
-    find_sources | awk 'BEGIN{srand()}{print rand()"\t"$0}' | sort -n | cut -f2- |
-      if [[ -n "$MAX_FILES" ]]; then head -"$MAX_FILES"; else cat; fi \
-        >"$STATUS_DIR/hunt_queue"
-  fi
+  echo "    Smart discovery returned no valid files; falling back to standard queue"
+  build_standard_hunt_queue
 fi
+echo ""
 
 # Phase 1: Hunt
 hunt_total=$(wc -l <"$STATUS_DIR/hunt_queue" | tr -d ' ')

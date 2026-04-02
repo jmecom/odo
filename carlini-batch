@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any
+
+try:
+    import fcntl
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(f"fcntl unavailable: {exc}")
+
+
+BATCH_DIRNAME = ".carlini-batch"
+RUNS_DIRNAME = "runs"
+CURRENT_RUN_FILENAME = "current-run"
+LOCK_FILENAME = "lock"
+STATUS_FILENAME = "batch-status.json"
+SOURCE_FILENAME = ".carlini-source.json"
+LOG_FILENAME = "batch.log"
+STATE_ORDER = {
+    "failed": 0,
+    "interrupted": 1,
+    "auditing": 2,
+    "cloning": 3,
+    "queued": 4,
+    "skipped": 5,
+    "done": 6,
+}
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat(timespec="seconds")
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--"
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_name = handle.name
+    os.replace(temp_name, path)
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def resolve_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def default_batch_jobs() -> int:
+    cpu_count = os.cpu_count() or 4
+    repo_jobs = os.environ.get("JOBS", "4")
+    try:
+        per_repo_jobs = max(1, int(repo_jobs))
+    except ValueError:
+        per_repo_jobs = 4
+    auto_jobs = max(1, cpu_count // per_repo_jobs)
+    return max(1, min(8, auto_jobs))
+
+
+def slug_repo(repo: str) -> str:
+    slug = repo.strip()
+    slug = re.sub(r"^[^@]+@", "", slug)
+    slug = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", slug)
+    slug = slug.replace(":", "/")
+    slug = slug.rstrip("/")
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
+    return slug or "repo"
+
+
+def normalize_repo(repo: str) -> str:
+    repo = repo.strip()
+    path = Path(repo).expanduser()
+    if path.exists():
+        return str(path.resolve())
+    normalized = repo
+    normalized = re.sub(r"^[^@]+@", "", normalized)
+    normalized = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", normalized)
+    normalized = normalized.replace(":", "/")
+    normalized = normalized.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def load_repo_file(path: Path) -> list[str]:
+    if not path.is_file():
+        raise SystemExit(f"Repo list file not found: {path}")
+    repos: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        repo = line.strip()
+        if not repo or repo.startswith("#"):
+            continue
+        repos.append(repo)
+    return repos
+
+
+def tail_lines(path: Path, count: int) -> list[str]:
+    if count <= 0 or not path.is_file():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-count:]
+    except OSError:
+        return []
+
+
+@dataclass(frozen=True)
+class Job:
+    index: int
+    total: int
+    repo: str
+    repo_id: str
+    slug: str
+    clone_dir: Path
+    out_dir: Path
+    log_path: Path
+    status_path: Path
+
+
+class StatusStore:
+    def __init__(self, out_root: Path, run_id: str, jobs: list[Job]) -> None:
+        self.out_root = out_root
+        self.batch_root = out_root / BATCH_DIRNAME
+        self.run_dir = self.batch_root / RUNS_DIRNAME / run_id
+        self.run_path = self.run_dir / "run.json"
+        self.manifest_path = self.run_dir / "manifest.json"
+        self.current_run_path = self.batch_root / CURRENT_RUN_FILENAME
+        self.jobs = jobs
+        self._lock = threading.Lock()
+        self.batch_root.mkdir(parents=True, exist_ok=True)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_current_run(self) -> None:
+        self.current_run_path.write_text(self.run_dir.name, encoding="utf-8")
+
+    def write_manifest(self) -> None:
+        payload = {
+            "run_id": self.run_dir.name,
+            "out_root": str(self.out_root),
+            "jobs": [
+                {
+                    "index": job.index,
+                    "total": job.total,
+                    "repo": job.repo,
+                    "repo_id": job.repo_id,
+                    "slug": job.slug,
+                    "clone_dir": str(job.clone_dir),
+                    "out_dir": str(job.out_dir),
+                    "log_path": str(job.log_path),
+                    "status_path": str(job.status_path),
+                }
+                for job in self.jobs
+            ],
+        }
+        atomic_write_json(self.manifest_path, payload)
+
+    def write_run(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            atomic_write_json(self.run_path, payload)
+
+    def update_job(self, job: Job, **fields: Any) -> dict[str, Any]:
+        with self._lock:
+            payload = read_json(job.status_path) or {}
+            payload.setdefault("repo", job.repo)
+            payload.setdefault("repo_id", job.repo_id)
+            payload.setdefault("slug", job.slug)
+            payload.setdefault("clone_dir", str(job.clone_dir))
+            payload.setdefault("out_dir", str(job.out_dir))
+            payload.setdefault("log_path", str(job.log_path))
+            payload.setdefault("index", job.index)
+            payload.setdefault("total", job.total)
+            payload["run_id"] = self.run_dir.name
+            payload["updated_at"] = iso_now()
+            for key, value in fields.items():
+                payload[key] = value
+            atomic_write_json(job.status_path, payload)
+            return payload
+
+    def load_statuses(self) -> list[dict[str, Any]]:
+        statuses: list[dict[str, Any]] = []
+        for job in self.jobs:
+            payload = read_json(job.status_path) or {
+                "repo": job.repo,
+                "repo_id": job.repo_id,
+                "slug": job.slug,
+                "state": "queued",
+                "stage": "waiting",
+                "index": job.index,
+                "total": job.total,
+                "log_path": str(job.log_path),
+                "out_dir": str(job.out_dir),
+                "clone_dir": str(job.clone_dir),
+            }
+            statuses.append(payload)
+        return statuses
+
+    def summary_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for status in self.load_statuses():
+            state = str(status.get("state", "unknown"))
+            counts[state] = counts.get(state, 0) + 1
+        return counts
+
+
+class BatchRunner:
+    def __init__(
+        self,
+        *,
+        jobs: list[Job],
+        status_store: StatusStore,
+        carlini_bin: Path,
+        carlini_args: list[str],
+        fail_fast: bool,
+        refresh_clones: bool,
+    ) -> None:
+        self.jobs = jobs
+        self.status_store = status_store
+        self.carlini_bin = carlini_bin
+        self.carlini_args = carlini_args
+        self.fail_fast = fail_fast
+        self.refresh_clones = refresh_clones
+        self.stop_event = threading.Event()
+        self.print_lock = threading.Lock()
+        self.process_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
+        self.running_processes: dict[str, subprocess.Popen[str]] = {}
+        self.failure_count = 0
+        self.first_failure: str | None = None
+
+    def log(self, message: str) -> None:
+        with self.print_lock:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+    def set_running_process(self, slug: str, process: subprocess.Popen[str] | None) -> None:
+        with self.process_lock:
+            if process is None:
+                self.running_processes.pop(slug, None)
+            else:
+                self.running_processes[slug] = process
+
+    def stop_running_processes(self) -> None:
+        with self.process_lock:
+            processes = list(self.running_processes.items())
+        for slug, process in processes:
+            if process.poll() is not None:
+                continue
+            self.log(f"[{slug}] terminating due to stop request")
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                continue
+
+    def write_source_metadata(self, job: Job) -> None:
+        payload = {"repo": job.repo, "repo_id": job.repo_id, "slug": job.slug}
+        atomic_write_json(job.clone_dir / SOURCE_FILENAME, payload)
+        atomic_write_json(job.out_dir / SOURCE_FILENAME, payload)
+
+    def run_subprocess(
+        self,
+        *,
+        job: Job,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+        state: str,
+        stage: str,
+        stage_label: str,
+    ) -> tuple[int, str | None]:
+        job.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with job.log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"\n[{iso_now()}] {stage_label}: {' '.join(command)}\n")
+            log_file.flush()
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd) if cwd is not None else None,
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.set_running_process(job.slug, process)
+            self.status_store.update_job(job, stage=stage, pid=process.pid, state=state)
+
+            while True:
+                if self.stop_event.is_set() and process.poll() is None:
+                    log_file.write(f"[{iso_now()}] stop requested, terminating process\n")
+                    log_file.flush()
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        log_file.write(f"[{iso_now()}] process did not exit after SIGTERM, killing\n")
+                        log_file.flush()
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                try:
+                    returncode = process.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            self.set_running_process(job.slug, None)
+            terminated = self.stop_event.is_set() and returncode != 0
+            return returncode, "terminated" if terminated else None
+
+    def ensure_clone(self, job: Job) -> tuple[bool, str]:
+        if (job.clone_dir / ".git").is_dir():
+            self.write_source_metadata(job)
+            if not self.refresh_clones:
+                with job.log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write(f"[{iso_now()}] reusing existing clone: {job.clone_dir}\n")
+                return True, "reused existing clone"
+
+            command = ["git", "-C", str(job.clone_dir), "pull", "--ff-only"]
+            returncode, _ = self.run_subprocess(
+                job=job,
+                command=command,
+                state="cloning",
+                stage="clone",
+                stage_label="Refreshing clone",
+            )
+            if returncode != 0:
+                return False, f"git pull failed with exit code {returncode}"
+            self.write_source_metadata(job)
+            return True, "refreshed existing clone"
+
+        if job.clone_dir.exists():
+            return False, f"destination exists and is not a git repo: {job.clone_dir}"
+
+        job.clone_dir.parent.mkdir(parents=True, exist_ok=True)
+        command = ["git", "clone", job.repo, str(job.clone_dir)]
+        returncode, termination = self.run_subprocess(
+            job=job,
+            command=command,
+            state="cloning",
+            stage="clone",
+            stage_label="Cloning repository",
+        )
+        if returncode != 0:
+            if termination:
+                return False, "clone interrupted"
+            return False, f"git clone failed with exit code {returncode}"
+        self.write_source_metadata(job)
+        return True, "cloned"
+
+    def audit_repo(self, job: Job) -> tuple[bool, str]:
+        env = os.environ.copy()
+        env["OUTDIR"] = str(job.out_dir)
+        command = [str(self.carlini_bin), *self.carlini_args, str(job.clone_dir)]
+        returncode, termination = self.run_subprocess(
+            job=job,
+            command=command,
+            env=env,
+            state="auditing",
+            stage="audit",
+            stage_label="Running Carlini",
+        )
+        if returncode != 0:
+            if termination:
+                return False, "audit interrupted"
+            return False, f"audit failed with exit code {returncode}"
+        return True, "audit completed"
+
+    def mark_failed(self, job: Job, stage: str, message: str, exit_code: int | None = None) -> None:
+        with self.stats_lock:
+            self.failure_count += 1
+            if self.first_failure is None:
+                self.first_failure = job.slug
+        self.status_store.update_job(
+            job,
+            state="failed",
+            stage=stage,
+            exit_code=exit_code,
+            error=message,
+            finished_at=iso_now(),
+            pid=None,
+        )
+        self.log(f"[{job.slug}] FAILED during {stage}: {message} (log: {job.log_path})")
+        if self.fail_fast:
+            self.stop_event.set()
+            self.stop_running_processes()
+
+    def mark_interrupted(self, job: Job, stage: str, message: str) -> None:
+        self.status_store.update_job(
+            job,
+            state="interrupted",
+            stage=stage,
+            error=message,
+            finished_at=iso_now(),
+            pid=None,
+        )
+        self.log(f"[{job.slug}] interrupted during {stage} (log: {job.log_path})")
+
+    def worker(self, work_queue: queue.Queue[Job]) -> None:
+        while not self.stop_event.is_set():
+            try:
+                job = work_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            if self.stop_event.is_set():
+                work_queue.put(job)
+                return
+
+            self.log(f"[{job.slug}] starting [{job.index}/{job.total}] {job.repo}")
+            self.status_store.update_job(job, state="cloning", stage="clone", started_at=iso_now())
+
+            ok, clone_message = self.ensure_clone(job)
+            if not ok:
+                if self.stop_event.is_set() and clone_message == "clone interrupted":
+                    self.mark_interrupted(job, "clone", clone_message)
+                else:
+                    self.mark_failed(job, "clone", clone_message)
+                work_queue.task_done()
+                continue
+
+            self.log(f"[{job.slug}] {clone_message}")
+
+            if self.stop_event.is_set():
+                self.mark_interrupted(job, "clone", "stopped before audit")
+                work_queue.task_done()
+                continue
+
+            self.status_store.update_job(job, state="auditing", stage="audit", pid=None)
+            self.log(f"[{job.slug}] auditing -> {job.out_dir}")
+            ok, audit_message = self.audit_repo(job)
+            if not ok:
+                if self.stop_event.is_set() and audit_message == "audit interrupted":
+                    self.mark_interrupted(job, "audit", audit_message)
+                else:
+                    self.mark_failed(job, "audit", audit_message)
+                work_queue.task_done()
+                continue
+
+            self.status_store.update_job(
+                job,
+                state="done",
+                stage="audit",
+                error=None,
+                exit_code=0,
+                finished_at=iso_now(),
+                pid=None,
+            )
+            duration = read_json(job.status_path)
+            started_at = duration.get("started_at") if duration else None
+            elapsed = None
+            if started_at:
+                try:
+                    elapsed = utc_now() - datetime.fromisoformat(started_at)
+                except ValueError:
+                    elapsed = None
+            self.log(
+                f"[{job.slug}] done in {format_duration(elapsed.total_seconds() if elapsed else None)} "
+                f"(log: {job.log_path})"
+            )
+            work_queue.task_done()
+
+    def mark_unstarted_jobs(self, work_queue: queue.Queue[Job], state: str, message: str) -> None:
+        while True:
+            try:
+                job = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.status_store.update_job(
+                job,
+                state=state,
+                stage="waiting",
+                error=message,
+                finished_at=iso_now(),
+                pid=None,
+            )
+            work_queue.task_done()
+
+    def run(self, max_workers: int) -> int:
+        self.log(
+            f"Run {self.status_store.run_dir.name}: {len(self.jobs)} repos, "
+            f"jobs={max_workers}, out-root={self.status_store.out_root}"
+        )
+        work_queue: queue.Queue[Job] = queue.Queue()
+        for job in self.jobs:
+            work_queue.put(job)
+
+        workers = []
+        for _ in range(max_workers):
+            thread = threading.Thread(target=self.worker, args=(work_queue,), daemon=True)
+            thread.start()
+            workers.append(thread)
+
+        for thread in workers:
+            thread.join()
+
+        if self.stop_event.is_set():
+            pending_state = "skipped" if self.fail_fast and self.failure_count > 0 else "interrupted"
+            pending_reason = "fail-fast triggered" if pending_state == "skipped" else "batch interrupted"
+            self.mark_unstarted_jobs(work_queue, pending_state, pending_reason)
+
+        return 1 if self.failure_count > 0 else 0
+
+
+def split_wrapper_and_carlini_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    if "--" not in argv:
+        return argv, []
+    index = argv.index("--")
+    return argv[:index], argv[index + 1 :]
+
+
+def build_parser(default_jobs: int, default_clone_root: Path, default_out_root: Path) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="carlini-batch",
+        description="Clone many repositories and run carlini.sh with durable per-repo status.",
+        epilog=(
+            "Wrapper args stop at `--`; everything after that is forwarded to carlini.sh for every repo.\n"
+            "Example: ./carlini-batch --repo-file repos.txt --jobs 3 -- --max-files 50"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("repos", nargs="*", help="Remote URLs or local git repository paths.")
+    parser.add_argument("--repo-file", help="Read repositories from FILE, one per line.")
+    parser.add_argument(
+        "--clone-root",
+        default=str(default_clone_root),
+        help=f"Directory to clone repositories into. Default: {default_clone_root}",
+    )
+    parser.add_argument(
+        "--out-root",
+        default=str(default_out_root),
+        help=f"Directory to store per-repo reports in. Default: {default_out_root}",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=default_jobs,
+        help=f"Number of repositories to process in parallel. Default: {default_jobs}",
+    )
+    parser.add_argument("--fail-fast", action="store_true", help="Stop launching new jobs after the first failure.")
+    parser.add_argument("--refresh-clones", action="store_true", help="Run git pull --ff-only on reused clones.")
+    parser.add_argument("--status", action="store_true", help="Show status for the current or latest batch run.")
+    parser.add_argument("--watch", action="store_true", help="Refresh status output until interrupted.")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON in --status mode.")
+    parser.add_argument("--match", help="Filter status output to repos or slugs containing this text.")
+    parser.add_argument("--tail", type=int, default=0, help="Show the last N log lines per job in --status mode.")
+    return parser
+
+
+def ensure_repo_inputs(args: argparse.Namespace) -> list[str]:
+    repos = list(args.repos)
+    if args.repo_file:
+        repos.extend(load_repo_file(resolve_path(args.repo_file)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for repo in repos:
+        repo = repo.strip()
+        if not repo:
+            continue
+        key = normalize_repo(repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(repo)
+    if not deduped:
+        raise SystemExit("No repositories provided. Use positional args or --repo-file.")
+    return deduped
+
+
+def existing_repo_metadata(path: Path) -> dict[str, Any] | None:
+    return read_json(path / SOURCE_FILENAME)
+
+
+def clone_origin_repo_id(path: Path) -> str | None:
+    if not (path / ".git").is_dir():
+        return None
+    try:
+        remote = subprocess.check_output(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return normalize_repo(remote)
+
+
+def candidate_belongs_to_repo(clone_dir: Path, out_dir: Path, repo_id: str) -> bool:
+    for base in (clone_dir, out_dir):
+        metadata = existing_repo_metadata(base)
+        if metadata and metadata.get("repo_id") == repo_id:
+            return True
+    origin_repo_id = clone_origin_repo_id(clone_dir)
+    return origin_repo_id == repo_id if origin_repo_id else False
+
+
+def build_jobs(repos: list[str], clone_root: Path, out_root: Path) -> list[Job]:
+    jobs: list[Job] = []
+    used_slugs: set[str] = set()
+
+    for index, repo in enumerate(repos, start=1):
+        repo_id = normalize_repo(repo)
+        base_slug = slug_repo(repo)
+        suffix = 1
+        while True:
+            slug = base_slug if suffix == 1 else f"{base_slug}-{suffix}"
+            clone_dir = clone_root / slug
+            out_dir = out_root / slug
+            occupied = clone_dir.exists() or out_dir.exists() or slug in used_slugs
+            if not occupied or candidate_belongs_to_repo(clone_dir, out_dir, repo_id):
+                used_slugs.add(slug)
+                jobs.append(
+                    Job(
+                        index=index,
+                        total=len(repos),
+                        repo=repo,
+                        repo_id=repo_id,
+                        slug=slug,
+                        clone_dir=clone_dir,
+                        out_dir=out_dir,
+                        log_path=out_dir / LOG_FILENAME,
+                        status_path=out_dir / STATUS_FILENAME,
+                    )
+                )
+                break
+            suffix += 1
+    return jobs
+
+
+def render_status(
+    *,
+    run_payload: dict[str, Any],
+    statuses: list[dict[str, Any]],
+    json_mode: bool,
+    match: str | None,
+    tail: int,
+) -> str:
+    filtered = statuses
+    if match:
+        lowered = match.lower()
+        filtered = [
+            status
+            for status in statuses
+            if lowered in str(status.get("slug", "")).lower() or lowered in str(status.get("repo", "")).lower()
+        ]
+
+    summary: dict[str, int] = {}
+    for status in statuses:
+        state = str(status.get("state", "unknown"))
+        summary[state] = summary.get(state, 0) + 1
+
+    if json_mode:
+        payload = {
+            "run": run_payload,
+            "summary": summary,
+            "jobs": filtered,
+        }
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    lines = [
+        f"Run: {run_payload.get('run_id', '--')}  state={run_payload.get('state', '--')}  "
+        f"started={run_payload.get('started_at', '--')}",
+        "Summary: "
+        + ", ".join(f"{state}={summary[state]}" for state in sorted(summary, key=lambda item: (STATE_ORDER.get(item, 99), item))),
+        "",
+        f"{'STATE':<12} {'STAGE':<10} {'ELAPSED':<8} {'SLUG':<24} REPO",
+        f"{'-' * 12} {'-' * 10} {'-' * 8} {'-' * 24} {'-' * 30}",
+    ]
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, str]:
+        state = str(item.get("state", "unknown"))
+        return (STATE_ORDER.get(state, 99), str(item.get("slug", "")))
+
+    for status in sorted(filtered, key=sort_key):
+        started_at = status.get("started_at")
+        finished_at = status.get("finished_at")
+        elapsed_seconds = None
+        if started_at:
+            try:
+                start_dt = datetime.fromisoformat(started_at)
+                end_dt = datetime.fromisoformat(finished_at) if finished_at else utc_now()
+                elapsed_seconds = (end_dt - start_dt).total_seconds()
+            except ValueError:
+                elapsed_seconds = None
+
+        lines.append(
+            f"{str(status.get('state', '--')):<12} "
+            f"{str(status.get('stage', '--')):<10} "
+            f"{format_duration(elapsed_seconds):<8} "
+            f"{str(status.get('slug', '--')):<24} "
+            f"{status.get('repo', '--')}"
+        )
+        lines.append(f"  log: {status.get('log_path', '--')}")
+        error = status.get("error")
+        if error:
+            lines.append(f"  note: {error}")
+        for line in tail_lines(Path(str(status.get("log_path", ""))), tail):
+            lines.append(f"    {line}")
+
+    if not filtered:
+        lines.append("No jobs matched the requested filter.")
+
+    return "\n".join(lines)
+
+
+def load_run_state(out_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    batch_root = out_root / BATCH_DIRNAME
+    current_run_path = batch_root / CURRENT_RUN_FILENAME
+    if not current_run_path.is_file():
+        raise SystemExit(f"No batch state found under {out_root}")
+
+    run_id = current_run_path.read_text(encoding="utf-8").strip()
+    run_dir = batch_root / RUNS_DIRNAME / run_id
+    run_payload = read_json(run_dir / "run.json")
+    manifest = read_json(run_dir / "manifest.json")
+    if not run_payload or not manifest:
+        raise SystemExit(f"Incomplete batch state for run {run_id}")
+
+    statuses: list[dict[str, Any]] = []
+    for job_payload in manifest.get("jobs", []):
+        status_path = Path(job_payload["status_path"])
+        status = read_json(status_path) or {
+            "repo": job_payload["repo"],
+            "repo_id": job_payload["repo_id"],
+            "slug": job_payload["slug"],
+            "state": "queued",
+            "stage": "waiting",
+            "log_path": job_payload["log_path"],
+            "out_dir": job_payload["out_dir"],
+            "clone_dir": job_payload["clone_dir"],
+            "index": job_payload["index"],
+            "total": job_payload["total"],
+        }
+        statuses.append(status)
+    return run_payload, statuses
+
+
+def show_status(args: argparse.Namespace, out_root: Path) -> int:
+    def render_once() -> str:
+        run_payload, statuses = load_run_state(out_root)
+        return render_status(
+            run_payload=run_payload,
+            statuses=statuses,
+            json_mode=args.json,
+            match=args.match,
+            tail=args.tail,
+        )
+
+    if not args.watch:
+        print(render_once())
+        return 0
+
+    if args.json:
+        raise SystemExit("--watch and --json cannot be combined")
+
+    while True:
+        print("\033[2J\033[H", end="")
+        print(render_once())
+        time.sleep(2)
+
+
+def require_tools(carlini_bin: Path) -> None:
+    if not shutil_which("git"):
+        raise SystemExit("git required in PATH")
+    if not carlini_bin.is_file():
+        raise SystemExit(f"carlini.sh not found: {carlini_bin}")
+    if not os.access(carlini_bin, os.X_OK):
+        raise SystemExit(f"carlini.sh not executable: {carlini_bin}")
+
+
+def shutil_which(binary: str) -> str | None:
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory) / binary
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def run_batch(args: argparse.Namespace, carlini_args: list[str], script_dir: Path) -> int:
+    clone_root = resolve_path(args.clone_root)
+    out_root = resolve_path(args.out_root)
+    carlini_bin = resolve_path(os.environ.get("CARLINI_BIN", str(script_dir / "carlini.sh")))
+    require_tools(carlini_bin)
+
+    repos = ensure_repo_inputs(args)
+    jobs = build_jobs(repos, clone_root, out_root)
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    clone_root.mkdir(parents=True, exist_ok=True)
+    batch_root = out_root / BATCH_DIRNAME
+    batch_root.mkdir(parents=True, exist_ok=True)
+    lock_path = batch_root / LOCK_FILENAME
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"Another carlini batch run is already using {out_root}. Query it with --status.")
+
+    run_id = utc_now().strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+    status_store = StatusStore(out_root, run_id, jobs)
+    status_store.write_current_run()
+    status_store.write_manifest()
+
+    run_payload = {
+        "run_id": run_id,
+        "state": "running",
+        "started_at": iso_now(),
+        "finished_at": None,
+        "pid": os.getpid(),
+        "jobs": args.jobs,
+        "repo_count": len(jobs),
+        "clone_root": str(clone_root),
+        "out_root": str(out_root),
+        "carlini_bin": str(carlini_bin),
+        "carlini_args": carlini_args,
+        "fail_fast": args.fail_fast,
+        "refresh_clones": args.refresh_clones,
+    }
+    status_store.write_run(run_payload)
+
+    for job in jobs:
+        job.out_dir.mkdir(parents=True, exist_ok=True)
+        job.log_path.write_text(
+            f"[{iso_now()}] queued repo={job.repo} clone_dir={job.clone_dir} out_dir={job.out_dir}\n",
+            encoding="utf-8",
+        )
+        status_store.update_job(
+            job,
+            state="queued",
+            stage="waiting",
+            started_at=None,
+            finished_at=None,
+            error=None,
+            exit_code=None,
+            pid=None,
+        )
+
+    runner = BatchRunner(
+        jobs=jobs,
+        status_store=status_store,
+        carlini_bin=carlini_bin,
+        carlini_args=carlini_args,
+        fail_fast=args.fail_fast,
+        refresh_clones=args.refresh_clones,
+    )
+
+    interrupted = {"value": False}
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        interrupted["value"] = True
+        runner.log(f"Received signal {signum}; stopping batch")
+        runner.stop_event.set()
+        runner.stop_running_processes()
+
+    previous_handlers = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    exit_code = 1
+    try:
+        exit_code = runner.run(args.jobs)
+    finally:
+        signal.signal(signal.SIGINT, previous_handlers[signal.SIGINT])
+        signal.signal(signal.SIGTERM, previous_handlers[signal.SIGTERM])
+
+        final_state = "completed"
+        if interrupted["value"]:
+            final_state = "interrupted"
+            exit_code = 130 if exit_code == 0 else exit_code
+        elif runner.failure_count > 0:
+            final_state = "failed"
+
+        final_payload = dict(run_payload)
+        final_payload["state"] = final_state
+        final_payload["finished_at"] = iso_now()
+        final_payload["failure_count"] = runner.failure_count
+        final_payload["summary"] = status_store.summary_counts()
+        final_payload["first_failure"] = runner.first_failure
+        status_store.write_run(final_payload)
+
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    if final_state == "completed":
+        runner.log(f"Completed {len(jobs)} repos. Clones: {clone_root} | Reports: {out_root}")
+    else:
+        runner.log(f"Run finished with state={final_state}. Query details with --status --out-root {out_root}")
+    return exit_code
+
+
+def main(argv: list[str]) -> int:
+    script_dir = Path(__file__).resolve().parent
+    wrapper_args, carlini_args = split_wrapper_and_carlini_args(argv)
+    default_clone_root = Path("clones")
+    default_out_root = Path.home() / "bughunt-reports"
+    parser = build_parser(default_batch_jobs(), default_clone_root, default_out_root)
+    args = parser.parse_args(wrapper_args)
+
+    if args.jobs <= 0:
+        raise SystemExit("--jobs must be positive")
+    if args.tail < 0:
+        raise SystemExit("--tail must be non-negative")
+    if args.watch and not args.status:
+        raise SystemExit("--watch only makes sense with --status")
+    if args.json and not args.status:
+        raise SystemExit("--json only makes sense with --status")
+    if args.match and not args.status:
+        raise SystemExit("--match only makes sense with --status")
+    if args.status and (args.repo_file or args.repos):
+        raise SystemExit("--status does not take repo inputs")
+
+    out_root = resolve_path(args.out_root)
+    if args.status:
+        return show_status(args, out_root)
+    return run_batch(args, carlini_args, script_dir)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
