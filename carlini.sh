@@ -425,7 +425,7 @@ run_final_codex_review() {
   report_tmp=$(mktemp -d "$report_parent/.report.tmp.XXXXXX")
   codex_last="$OUTDIR/codex-final-review.md"
 
-  prompt=$(cat <<EOF
+prompt=$(cat <<EOF
 You are the final maintainer-facing reviewer for a vulnerability audit.
 
 Workspace:
@@ -456,6 +456,13 @@ Your job:
 Requirements:
 - Prefer commands that run from the repository root.
 - Make each accepted finding self-contained enough to hand directly to a maintainer.
+- Re-derive severity from the actual exploit story, not from the prior report label. You may raise, lower, or keep the existing severity.
+- Use this rubric consistently:
+  - Critical: direct and realistic paths to arbitrary code execution, asset theft, signature forgery, authentication bypass to privileged action, or other severe confidentiality/integrity compromise.
+  - High: strong integrity or availability impact, or realistic memory corruption / parsing bugs with meaningful attacker control, even if full compromise is not shown.
+  - Medium: real security impact, but requiring material preconditions, unusual deployment assumptions, authenticated/local access, or yielding only limited confidentiality/integrity/availability harm.
+  - Low: defense-in-depth issues, diagnostic/logging problems, constrained crashes, or bugs whose security impact is real but narrow.
+- For each accepted finding, make the report explicit about attacker prerequisites, realistic blast radius, and why the chosen severity is the right one instead of one level higher or lower.
 - If nothing survives review, still create README.md and explain that no finding met the handoff bar.
 EOF
 )
@@ -520,7 +527,7 @@ Workspace:
 - Maintainer bundle to revise in place: $report_tmp
 
 Goal:
-Assume the underlying bugs are legitimate unless the existing bundle itself shows otherwise. Your task is to pressure-test whether the stated severity or impact is overstated, then lock down a realistic exploitability story.
+Assume the underlying bugs are legitimate unless the existing bundle itself shows otherwise. Your task is to re-derive the right severity and impact from the code path, PoC, and realistic threat model, then lock down a concrete exploitability story.
 
 Your job:
 1. Read README.md, REJECTED.md if present, every findings/*/REPORT.md, and each sibling poc/ directory under $report_tmp.
@@ -530,18 +537,29 @@ Your job:
    - what inputs or deployment conditions are required
    - what they can reliably achieve if exploitation succeeds
    - what limits, mitigations, or operational assumptions reduce impact
-3. Challenge the current severity. If the stated severity is too high for the realistic scenario, lower it. If the severity is only justified under specific assumptions, state those assumptions explicitly.
-4. Update each REPORT.md in place so it includes:
+3. Re-rate the severity from scratch. You may raise it, lower it, or keep it, but the final label must match the most credible realistic scenario rather than the inherited wording.
+4. Use this rubric consistently:
+   - Critical: direct and realistic paths to arbitrary code execution, asset theft, signature forgery, authentication bypass to privileged action, or other severe confidentiality/integrity compromise.
+   - High: strong integrity or availability impact, or realistic memory corruption / parsing bugs with meaningful attacker control, even if full compromise is not shown.
+   - Medium: real security impact, but requiring material preconditions, unusual deployment assumptions, authenticated/local access, or yielding only limited confidentiality/integrity/availability harm.
+   - Low: defense-in-depth issues, diagnostic/logging problems, constrained crashes, or bugs whose security impact is real but narrow.
+5. If a finding's previous severity was too low, raise it and explain why. If it was too high, lower it and explain why. If the severity is only justified under specific assumptions, state those assumptions explicitly.
+6. Be especially careful with common failure modes:
+   - Crash-only PoCs or parser traps are usually not Critical unless there is a demonstrated path to stronger compromise.
+   - Authentication, authorization, signing, or asset-movement flaws may deserve High or Critical even if the PoC is simple.
+   - Secret leakage into logs/traces may deserve more than Low if realistic attackers can read those sinks and meaningfully reuse the data.
+   - Availability bugs in remotely reachable infrastructure may deserve more than Low when the service role is operationally important.
+7. Update each REPORT.md in place so it includes:
    - severity with clear rationale
    - exploitability story / realistic attack scenarios
    - attacker capabilities and preconditions
    - constraints, limiting factors, and likely mitigations
    - impact language that matches what the code path and PoC actually support
-5. Update README.md so each finding's severity and "why it matters" summary matches the revised exploitability story.
-6. If a finding remains valid but only supports a lower-severity impact, keep it in the bundle and rewrite it rather than rejecting it.
-7. If you cannot articulate any credible exploitation story from the available evidence, do not preserve inflated language. Downgrade the finding aggressively and explain the uncertainty in the report.
-8. Do not modify raw audit artifacts under $outdir_abs. Only edit files under $report_tmp.
-9. Do not mention CTF framing anywhere.
+8. Update README.md so each finding's severity and "why it matters" summary matches the revised exploitability story.
+9. If a finding remains valid but only supports a different severity than before, keep it in the bundle and rewrite it rather than rejecting it.
+10. If you cannot articulate any credible exploitation story from the available evidence, do not preserve inflated language. Downgrade aggressively and explain the uncertainty in the report. Likewise, do not preserve understated language when the evidence supports more impact.
+11. Do not modify raw audit artifacts under $outdir_abs. Only edit files under $report_tmp.
+12. Do not mention CTF framing anywhere.
 
 Requirements:
 - Prefer realistic, maintainer-useful threat models over maximalist attacker assumptions.
