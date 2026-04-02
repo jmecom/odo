@@ -1,2 +1,3 @@
-REPOS
+REPOS*
 remote-bughunt
+__pycache__
