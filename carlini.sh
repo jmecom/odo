@@ -3,23 +3,12 @@
 #
 # Usage: ./carlini.sh [options] [repo_dir]
 #   ./carlini.sh .
+#   ./carlini.sh --codex-only .
 #   ./carlini.sh --source-set "c,h,rs" .
 #   ./carlini.sh --exclude "vendor/**,third-party/**" .
 #   JOBS=8 ./carlini.sh .
 
 set -euo pipefail
-command -v jq &>/dev/null || {
-  echo "jq required: brew install jq" >&2
-  exit 1
-}
-command -v claude &>/dev/null || {
-  echo "claude CLI required in PATH" >&2
-  exit 1
-}
-command -v codex &>/dev/null || {
-  echo "codex CLI required in PATH" >&2
-  exit 1
-}
 
 DEFAULT_EXTS="c,h,cc,cpp,rs,go,py,js,ts,java,rb,php,swift,kt,zig"
 SOURCE_SET=""
@@ -27,9 +16,14 @@ EXCLUDES=""
 MAX_FILES=""
 PRIORITIZE=""
 REPO=""
+CODEX_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+  --codex-only)
+    CODEX_ONLY=1
+    shift
+    ;;
   --source-set)
     SOURCE_SET="$2"
     shift 2
@@ -144,6 +138,9 @@ abspath() {
 
 slug() { echo "$1" | sed 's|[/.]|_|g'; }
 
+REPO_ROOT=$(abspath "$REPO")
+OUTDIR_ABS=$(abspath "$OUTDIR")
+
 is_duplicate_report() {
   local report="$1"
   local duplicates_file="$OUTDIR/duplicates.txt"
@@ -189,6 +186,237 @@ JQ_TOOLS='
    else "" end) as $d |
   "\($t)\t\($d)"
 '
+
+JQ_CODEX_TOOLS='
+  if .type == "item.started" and .item.type == "command_execution" then
+    "Bash\t" + ((.item.command // "")[0:40])
+  elif .type == "item.completed" and .item.type == "agent_message" then
+    "Codex\t" + (((.item.text // "") | gsub("[\r\n\t]+"; " "))[0:60])
+  else
+    empty
+  end
+'
+
+require_cli_tools() {
+  command -v jq &>/dev/null || {
+    echo "jq required: brew install jq" >&2
+    exit 1
+  }
+  command -v codex &>/dev/null || {
+    echo "codex CLI required in PATH" >&2
+    exit 1
+  }
+  if [[ "$CODEX_ONLY" -eq 0 ]]; then
+    command -v claude &>/dev/null || {
+      echo "claude CLI required in PATH (or pass --codex-only)" >&2
+      exit 1
+    }
+  fi
+}
+
+run_codex_exec() {
+  local prompt="$1"
+  shift || true
+
+  codex exec \
+    --ephemeral \
+    -C "$REPO_ROOT" \
+    -m "$CODEX_MODEL" \
+    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
+    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
+    --skip-git-repo-check \
+    --dangerously-bypass-approvals-and-sandbox \
+    "$@" \
+    "$prompt"
+}
+
+run_claude_slot_prompt() {
+  local prompt="$1" sf="$2"
+
+  claude -p "$prompt" \
+    --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
+    --dangerously-skip-permissions \
+    --output-format stream-json --verbose 2>/dev/null |
+    jq --unbuffered -r "$JQ_TOOLS" 2>/dev/null |
+    while IFS=$'\t' read -r tool detail; do
+      printf "%s  %s\n" "$tool" "$detail" >>"$sf"
+    done
+}
+
+run_codex_slot_prompt() {
+  local prompt="$1" sf="$2"
+
+  run_codex_exec "$prompt" --json 2>/dev/null |
+    sed -n '/^{/p' |
+    jq --unbuffered -r "$JQ_CODEX_TOOLS" 2>/dev/null |
+    while IFS=$'\t' read -r tool detail; do
+      printf "%s  %s\n" "$tool" "$detail" >>"$sf"
+    done
+}
+
+run_slot_prompt() {
+  local prompt="$1" sf="$2"
+
+  if [[ "$CODEX_ONLY" -eq 1 ]]; then
+    run_codex_slot_prompt "$prompt" "$sf"
+  else
+    run_claude_slot_prompt "$prompt" "$sf"
+  fi
+}
+
+sanitize_discovery_output() {
+  local dest="$1"
+
+  sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+    sed 's/^```.*//; s/^- //; s/^[0-9]*[.)] //' |
+    while IFS= read -r f; do
+      [[ -n "$f" && -f "$f" ]] && echo "$f"
+    done |
+    awk '!seen[$0]++' >"$dest"
+}
+
+run_smart_discovery() {
+  local src_count="$1"
+  local provider_label raw_candidates prompt codex_last discovered
+
+  provider_label="Claude"
+  [[ "$CODEX_ONLY" -eq 1 ]] && provider_label="Codex"
+
+  echo "=== Phase 0: Smart file discovery ==="
+  echo "    Asking $provider_label to identify high-value attack surface files..."
+
+  : >"$STATUS_DIR/hunt_queue.raw"
+
+  if [[ "$CODEX_ONLY" -eq 1 ]]; then
+    raw_candidates="$STATUS_DIR/hunt_queue.codex.raw"
+    codex_last="$OUTDIR_ABS/codex-discovery.md"
+    rm -f "$raw_candidates"
+    prompt=$(cat <<EOF
+You are a security researcher doing a vulnerability audit of this codebase.
+
+Workspace:
+- Repository root: $REPO_ROOT
+- Complete source file list ($src_count files): $STATUS_DIR/all_sources
+- Output file: $raw_candidates
+
+Read the file list and identify the files most likely to contain exploitable vulnerabilities. Prioritize:
+- Files handling parsing, deserialization, or untrusted input
+- Crypto implementations and key management
+- Memory management, buffer operations, pointer arithmetic
+- Authentication, authorization, session handling
+- Network protocol handling, IPC, command dispatch
+- Files with "unsafe", raw pointer usage, or FFI boundaries
+
+Write ONLY a newline-separated list of file paths, most promising first, to $raw_candidates.
+Do not write commentary, markdown, numbering, or any other output file.
+EOF
+)
+    if run_codex_exec "$prompt" -o "$codex_last" >/dev/null 2>&1 && [[ -f "$raw_candidates" ]]; then
+      sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" <"$raw_candidates"
+    fi
+  else
+    claude -p "You are a security researcher doing a vulnerability audit of this codebase.
+
+Here is a list of all $src_count source files in the project:
+
+$(cat "$STATUS_DIR/all_sources")
+
+Identify the files most likely to contain exploitable vulnerabilities. Prioritize:
+- Files handling parsing, deserialization, or untrusted input
+- Crypto implementations and key management
+- Memory management, buffer operations, pointer arithmetic
+- Authentication, authorization, session handling
+- Network protocol handling, IPC, command dispatch
+- Files with \"unsafe\", raw pointer usage, or FFI boundaries
+
+Output ONLY a newline-separated list of file paths, most promising first. No commentary, no markdown, no numbering. Just paths, one per line." \
+      --model "$MODEL" --effort max --max-turns 10 \
+      --dangerously-skip-permissions \
+      2>/dev/null |
+      sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" || true
+  fi
+
+  discovered=$(wc -l <"$STATUS_DIR/hunt_queue.raw" | tr -d ' ')
+  echo "    $provider_label selected $discovered/$src_count files"
+
+  if [[ "$discovered" -gt 0 ]]; then
+    if [[ -n "$MAX_FILES" ]]; then
+      head -"$MAX_FILES" "$STATUS_DIR/hunt_queue.raw" >"$STATUS_DIR/hunt_queue"
+    else
+      cp "$STATUS_DIR/hunt_queue.raw" "$STATUS_DIR/hunt_queue"
+    fi
+  else
+    echo "    Smart discovery returned no valid files; falling back to standard queue"
+    build_standard_hunt_queue
+  fi
+  echo ""
+}
+
+run_dedupe_phase() {
+  local verified_count="$1"
+  local dupes prompt codex_last
+
+  echo "=== Phase 3: Deduplicating $verified_count verified reports ==="
+
+  if [[ "$CODEX_ONLY" -eq 1 ]]; then
+    codex_last="$OUTDIR_ABS/codex-dedup.md"
+    prompt=$(cat <<EOF
+You are a security researcher consolidating vulnerability reports.
+
+Workspace:
+- Repository root: $REPO_ROOT
+- Audit output directory: $OUTDIR_ABS
+
+Read every *.verified.md file under $OUTDIR_ABS. Many were found via different starting files but describe the same underlying vulnerability.
+
+Your job:
+1. Group reports that describe the same root-cause vulnerability.
+2. For each unique vulnerability, keep the single best report (most detailed, clearest reproduction steps).
+3. Write a summary to $OUTDIR_ABS/SUMMARY.md with:
+   - A table of unique vulnerabilities (severity, category, affected file(s), one-line description)
+   - For each unique vuln, which report file is the canonical one
+   - List of duplicate report files that can be ignored
+4. Write the list of duplicate file paths (one per line, nothing else) to $OUTDIR_ABS/duplicates.txt
+5. Do not modify the verified reports themselves.
+EOF
+)
+    run_codex_exec "$prompt" -o "$codex_last" >/dev/null 2>&1 || true
+  else
+    claude -p "You are a security researcher consolidating vulnerability reports.
+
+Below are all the verified vulnerability reports from this audit. Many were found via different starting files but describe the same underlying vulnerability.
+
+Your job:
+1. Group reports that describe the same root-cause vulnerability
+2. For each unique vulnerability, keep the single best report (most detailed, clearest reproduction steps)
+3. Write a summary to $OUTDIR/SUMMARY.md with:
+   - A table of unique vulnerabilities (severity, category, affected file(s), one-line description)
+   - For each unique vuln, which report file is the canonical one
+   - List of duplicate report files that can be ignored
+4. Write the list of duplicate file paths (one per line, nothing else) to $OUTDIR/duplicates.txt
+
+Reports:
+$(for f in "$OUTDIR"/*.verified.md; do
+    echo "--- $(basename "$f") ---"
+    cat "$f"
+    echo ""
+  done)
+" \
+      --model "$MODEL" --effort max --max-turns 10 \
+      --dangerously-skip-permissions \
+      >/dev/null 2>&1
+  fi
+
+  if [[ -f "$OUTDIR/duplicates.txt" ]]; then
+    dupes=$(wc -l <"$OUTDIR/duplicates.txt" | tr -d ' ')
+    echo "    Found $dupes duplicates. Unique findings in $OUTDIR/SUMMARY.md"
+  else
+    echo "    Dedup complete. See $OUTDIR/SUMMARY.md"
+  fi
+  echo ""
+}
+
+require_cli_tools
 
 # ── Display ──────────────────────────────────────────────────────────
 
@@ -283,6 +511,10 @@ hunt_worker() {
   awk -v s="$slot" -v j="$JOBS" '(NR-1) % j == s' "$STATUS_DIR/hunt_queue" |
     while IFS= read -r file; do
       local report="$OUTDIR/$(slug "$file").vuln.md"
+      local file_abs report_abs
+
+      file_abs=$(abspath "$file")
+      report_abs=$(abspath "$report")
       if [[ -f "$report" ]]; then
         bump_done
         continue
@@ -290,20 +522,13 @@ hunt_worker() {
 
       printf "ACTIVE\n%s\n" "$file" >"$sf"
 
-      claude -p \
-        "I'm competing in a CTF. Find me an exploitable vulnerability in this project. Start with $file.
+      run_slot_prompt \
+        "I'm competing in a CTF. Find me an exploitable vulnerability in this project. Start with $file_abs.
 
 Write the vulnerability report to this exact path:
-$report" \
-        --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
-        --dangerously-skip-permissions \
-        --output-format stream-json --verbose 2>/dev/null |
-        jq --unbuffered -r "$JQ_TOOLS" 2>/dev/null |
-        while IFS=$'\t' read -r tool detail; do
-          printf "%s  %s\n" "$tool" "$detail" >>"$sf"
-        done
+$report_abs" "$sf"
 
-      if [[ -f "$report" ]]; then
+      if [[ -f "$report_abs" ]]; then
         sed -i '' '1s/ACTIVE/DONE/' "$sf"
       else
         sed -i '' '1s/ACTIVE/FAIL/' "$sf"
@@ -321,6 +546,10 @@ verify_worker() {
   awk -v s="$slot" -v j="$JOBS" '(NR-1) % j == s' "$STATUS_DIR/verify_queue" |
     while IFS= read -r report; do
       local verified="${report%.vuln.md}.verified.md"
+      local report_abs verified_abs
+
+      report_abs=$(abspath "$report")
+      verified_abs=$(abspath "$verified")
       if [[ -f "$verified" ]]; then
         bump_done
         continue
@@ -328,21 +557,14 @@ verify_worker() {
 
       printf "ACTIVE\n%s\n" "$(basename "$report")" >"$sf"
 
-      claude -p \
+      run_slot_prompt \
         "I got an inbound vulnerability report at this exact path:
-$report
+$report_abs
 
 Verify for me that this is actually exploitable. Write the verification report to this exact path:
-$verified" \
-        --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
-        --dangerously-skip-permissions \
-        --output-format stream-json --verbose 2>/dev/null |
-        jq --unbuffered -r "$JQ_TOOLS" 2>/dev/null |
-        while IFS=$'\t' read -r tool detail; do
-          printf "%s  %s\n" "$tool" "$detail" >>"$sf"
-        done
+$verified_abs" "$sf"
 
-      if [[ -f "$verified" ]]; then
+      if [[ -f "$verified_abs" ]]; then
         sed -i '' '1s/ACTIVE/DONE/' "$sf"
       else
         sed -i '' '1s/ACTIVE/FAIL/' "$sf"
@@ -360,6 +582,10 @@ poc_worker() {
   awk -v s="$slot" -v j="$JOBS" '(NR-1) % j == s' "$STATUS_DIR/poc_queue" |
     while IFS= read -r verified; do
       local poc_dir="${verified%.verified.md}.poc"
+      local verified_abs poc_dir_abs vuln_report vuln_report_abs
+
+      verified_abs=$(abspath "$verified")
+      poc_dir_abs=$(abspath "$poc_dir")
       [[ -d "$poc_dir" ]] && {
         bump_done
         continue
@@ -367,42 +593,36 @@ poc_worker() {
 
       printf "ACTIVE\n%s\n" "$(basename "$verified")" >"$sf"
 
-      local vuln_report="${verified%.verified.md}.vuln.md"
+      vuln_report="${verified%.verified.md}.vuln.md"
+      vuln_report_abs=$(abspath "$vuln_report")
 
-      claude -p "You are a security researcher writing a proof-of-concept for a confirmed vulnerability finding, so that it can be submitted as a formal report.
+      run_slot_prompt "You are a security researcher writing a proof-of-concept for a confirmed vulnerability finding, so that it can be submitted as a formal report.
 
 Read the vulnerability report at this exact path:
-$vuln_report
+$vuln_report_abs
 
 Read the verification report at this exact path:
-$verified
+$verified_abs
 
 Your job:
-1. Create the directory $poc_dir/
+1. Create the directory $poc_dir_abs/
 2. Write a self-contained PoC that demonstrates the vulnerability is exploitable. This could be:
    - A C/Python/Rust test program that triggers the bug (crash, memory corruption, wrong output, etc.)
    - A crafted input file that causes the vulnerable code path to fail
    - A test harness that calls the vulnerable function with adversarial inputs
-3. Write $poc_dir/README.md with:
+3. Write $poc_dir_abs/README.md with:
    - Vulnerability title and severity
    - Root cause analysis (which function, what goes wrong, why)
    - Step-by-step reproduction instructions
    - Expected vs actual behavior
    - Impact assessment
    - Suggested fix
-4. Write a $poc_dir/Makefile or $poc_dir/run.sh so the PoC can be built and executed with a single command
-5. If applicable, write $poc_dir/patch.diff with a suggested fix
+4. Write a $poc_dir_abs/Makefile or $poc_dir_abs/run.sh so the PoC can be built and executed with a single command
+5. If applicable, write $poc_dir_abs/patch.diff with a suggested fix
 
-The PoC must be concrete and verifiable — a reviewer should be able to clone this repo, run your PoC, and see the bug trigger." \
-        --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
-        --dangerously-skip-permissions \
-        --output-format stream-json --verbose 2>/dev/null |
-        jq --unbuffered -r "$JQ_TOOLS" 2>/dev/null |
-        while IFS=$'\t' read -r tool detail; do
-          printf "%s  %s\n" "$tool" "$detail" >>"$sf"
-        done
+The PoC must be concrete and verifiable — a reviewer should be able to clone this repo, run your PoC, and see the bug trigger." "$sf"
 
-      if [[ -d "$poc_dir" ]]; then
+      if [[ -d "$poc_dir_abs" ]]; then
         sed -i '' '1s/ACTIVE/DONE/' "$sf"
       else
         sed -i '' '1s/ACTIVE/FAIL/' "$sf"
@@ -415,25 +635,23 @@ The PoC must be concrete and verifiable — a reviewer should be able to clone t
 
 run_final_codex_review() {
   local canonical_list="$1"
-  local repo_root outdir_abs report_dir_abs report_parent report_tmp codex_last prompt
+  local report_dir_abs report_parent report_tmp codex_last prompt
 
-  repo_root=$(abspath "$REPO")
-  outdir_abs=$(abspath "$OUTDIR")
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.report.tmp.XXXXXX")
-  codex_last="$OUTDIR/codex-final-review.md"
+  codex_last="$OUTDIR_ABS/codex-final-review.md"
 
 prompt=$(cat <<EOF
 You are the final maintainer-facing reviewer for a vulnerability audit.
 
 Workspace:
-- Repository root: $repo_root
-- Raw audit output: $outdir_abs
+- Repository root: $REPO_ROOT
+- Raw audit output: $OUTDIR_ABS
 - Canonical verified findings list: $canonical_list
-- Dedup summary, if present: $outdir_abs/SUMMARY.md
-- Duplicate list, if present: $outdir_abs/duplicates.txt
+- Dedup summary, if present: $OUTDIR_ABS/SUMMARY.md
+- Duplicate list, if present: $OUTDIR_ABS/duplicates.txt
 - Final maintainer bundle directory: $report_tmp
 
 Each canonical verified report may have:
@@ -450,7 +668,7 @@ Your job:
    - findings/<nn>_<slug>/poc/: runnable PoC files copied or improved from the raw PoC directory
    - findings/<nn>_<slug>/patch.diff when a credible fix is available
 5. Write REJECTED.md summarizing any discarded findings and why they were excluded from the maintainer handoff.
-6. Do not modify the raw audit artifacts under $outdir_abs. Only write under $report_tmp.
+6. Do not modify the raw audit artifacts under $OUTDIR_ABS. Only write under $report_tmp.
 7. Do not mention CTF framing anywhere in the final bundle.
 
 Requirements:
@@ -470,16 +688,7 @@ EOF
   echo "=== Phase 5: Codex final review ==="
   echo "    Reviewing canonical findings and PoCs with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
 
-  if codex exec \
-    --ephemeral \
-    -C "$repo_root" \
-    -m "$CODEX_MODEL" \
-    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
-    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
-    --skip-git-repo-check \
-    --dangerously-bypass-approvals-and-sandbox \
-    -o "$codex_last" \
-    "$prompt"; then
+  if run_codex_exec "$prompt" -o "$codex_last"; then
     if [[ ! -f "$report_tmp/README.md" ]]; then
       rm -rf "$report_tmp"
       echo "    Codex final review did not create $report_tmp/README.md" >&2
@@ -500,10 +709,8 @@ EOF
 }
 
 run_final_exploitability_review() {
-  local repo_root outdir_abs report_dir_abs report_parent report_tmp codex_last prompt
+  local report_dir_abs report_parent report_tmp codex_last prompt
 
-  repo_root=$(abspath "$REPO")
-  outdir_abs=$(abspath "$OUTDIR")
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
 
@@ -514,7 +721,7 @@ run_final_exploitability_review() {
 
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.exploitability.tmp.XXXXXX")
-  codex_last="$OUTDIR/codex-exploitability-review.md"
+  codex_last="$OUTDIR_ABS/codex-exploitability-review.md"
 
   cp -R "$report_dir_abs"/. "$report_tmp"/
 
@@ -522,8 +729,8 @@ run_final_exploitability_review() {
 You are the final exploitability and severity reviewer for a maintainer-facing vulnerability bundle.
 
 Workspace:
-- Repository root: $repo_root
-- Raw audit output: $outdir_abs
+- Repository root: $REPO_ROOT
+- Raw audit output: $OUTDIR_ABS
 - Maintainer bundle to revise in place: $report_tmp
 
 Goal:
@@ -558,7 +765,7 @@ Your job:
 8. Update README.md so each finding's severity and "why it matters" summary matches the revised exploitability story.
 9. If a finding remains valid but only supports a different severity than before, keep it in the bundle and rewrite it rather than rejecting it.
 10. If you cannot articulate any credible exploitation story from the available evidence, do not preserve inflated language. Downgrade aggressively and explain the uncertainty in the report. Likewise, do not preserve understated language when the evidence supports more impact.
-11. Do not modify raw audit artifacts under $outdir_abs. Only edit files under $report_tmp.
+11. Do not modify raw audit artifacts under $OUTDIR_ABS. Only edit files under $report_tmp.
 12. Do not mention CTF framing anywhere.
 
 Requirements:
@@ -571,16 +778,7 @@ EOF
   echo "=== Phase 6: Codex exploitability review ==="
   echo "    Pressure-testing severity and exploitability stories with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
 
-  if codex exec \
-    --ephemeral \
-    -C "$repo_root" \
-    -m "$CODEX_MODEL" \
-    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
-    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
-    --skip-git-repo-check \
-    --dangerously-bypass-approvals-and-sandbox \
-    -o "$codex_last" \
-    "$prompt"; then
+  if run_codex_exec "$prompt" -o "$codex_last"; then
     if [[ ! -f "$report_tmp/README.md" ]]; then
       rm -rf "$report_tmp"
       echo "    Codex exploitability review did not preserve $report_tmp/README.md" >&2
@@ -601,55 +799,9 @@ EOF
 # ── Main ─────────────────────────────────────────────────────────────
 
 # Phase 0: Smart discovery
-echo "=== Phase 0: Smart file discovery ==="
-echo "    Asking Claude to identify high-value attack surface files..."
-
 find_sources >"$STATUS_DIR/all_sources"
 src_count=$(wc -l <"$STATUS_DIR/all_sources" | tr -d ' ')
-
-DISCOVER_PROMPT="You are a security researcher doing a vulnerability audit of this codebase.
-
-Here is a list of all $src_count source files in the project:
-
-$(cat "$STATUS_DIR/all_sources")
-
-Identify the files most likely to contain exploitable vulnerabilities. Prioritize:
-- Files handling parsing, deserialization, or untrusted input
-- Crypto implementations and key management
-- Memory management, buffer operations, pointer arithmetic
-- Authentication, authorization, session handling
-- Network protocol handling, IPC, command dispatch
-- Files with \"unsafe\", raw pointer usage, or FFI boundaries
-
-Output ONLY a newline-separated list of file paths, most promising first. No commentary, no markdown, no numbering. Just paths, one per line."
-
-claude -p "$DISCOVER_PROMPT" \
-  --model "$MODEL" --effort max --max-turns 10 \
-  --dangerously-skip-permissions \
-  2>/dev/null |
-  sed 's/^[[:space:]]*//' |
-  sed 's/^```.*//; s/^- //; s/^[0-9]*[.)] //' |
-  grep -E '^\./|^[a-zA-Z]' |
-  while IFS= read -r f; do
-    [[ -f "$f" ]] && echo "$f"
-  done \
-  | awk '!seen[$0]++' \
-    >"$STATUS_DIR/hunt_queue.raw" || true
-
-discovered=$(wc -l <"$STATUS_DIR/hunt_queue.raw" | tr -d ' ')
-echo "    Claude selected $discovered/$src_count files"
-
-if [[ "$discovered" -gt 0 ]]; then
-  if [[ -n "$MAX_FILES" ]]; then
-    head -"$MAX_FILES" "$STATUS_DIR/hunt_queue.raw" >"$STATUS_DIR/hunt_queue"
-  else
-    cp "$STATUS_DIR/hunt_queue.raw" "$STATUS_DIR/hunt_queue"
-  fi
-else
-  echo "    Smart discovery returned no valid files; falling back to standard queue"
-  build_standard_hunt_queue
-fi
-echo ""
+run_smart_discovery "$src_count"
 
 # Phase 1: Hunt
 hunt_total=$(wc -l <"$STATUS_DIR/hunt_queue" | tr -d ' ')
@@ -664,41 +816,7 @@ run_workers verify_worker "Phase 2: Verify" "$verify_total"
 # Phase 3: Dedupe
 verified_count=$(find "$OUTDIR" -name "*.verified.md" 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$verified_count" -gt 1 ]]; then
-  echo "=== Phase 3: Deduplicating $verified_count verified reports ==="
-
-  DEDUP_PROMPT="You are a security researcher consolidating vulnerability reports.
-
-Below are all the verified vulnerability reports from this audit. Many were found via different starting files but describe the same underlying vulnerability.
-
-Your job:
-1. Group reports that describe the same root-cause vulnerability
-2. For each unique vulnerability, keep the single best report (most detailed, clearest reproduction steps)
-3. Write a summary to $OUTDIR/SUMMARY.md with:
-   - A table of unique vulnerabilities (severity, category, affected file(s), one-line description)
-   - For each unique vuln, which report file is the canonical one
-   - List of duplicate report files that can be ignored
-4. Write the list of duplicate file paths (one per line, nothing else) to $OUTDIR/duplicates.txt
-
-Reports:
-$(for f in "$OUTDIR"/*.verified.md; do
-    echo "--- $(basename "$f") ---"
-    cat "$f"
-    echo ""
-  done)
-"
-
-  claude -p "$DEDUP_PROMPT" \
-    --model "$MODEL" --effort max --max-turns 10 \
-    --dangerously-skip-permissions \
-    >/dev/null 2>&1
-
-  if [[ -f "$OUTDIR/duplicates.txt" ]]; then
-    dupes=$(wc -l <"$OUTDIR/duplicates.txt" | tr -d ' ')
-    echo "    Found $dupes duplicates. Unique findings in $OUTDIR/SUMMARY.md"
-  else
-    echo "    Dedup complete. See $OUTDIR/SUMMARY.md"
-  fi
-  echo ""
+  run_dedupe_phase "$verified_count"
 fi
 
 # Phase 4: PoC generation
