@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Generate a static HTML browser for Carlini final report bundles."""
+"""Generate a Markdown report for Carlini final report bundles."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import re
-import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -21,15 +20,26 @@ SEVERITY_ORDER = {
     "unknown": 5,
 }
 
+SEVERITY_LEVELS = (
+    "critical",
+    "high",
+    "medium",
+    "low",
+    "informational",
+    "unknown",
+)
+
 FIELD_NAME_RE = {
     "severity": ("severity", "risk", "impact"),
     "component": ("affected component", "affected area", "component"),
 }
 
+HEADING_RE = re.compile(r"^(#{1,6})(\s+.*)$")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a static report browser from Carlini maintainer-ready report bundles."
+        description="Generate a Markdown report from Carlini maintainer-ready report bundles."
     )
     parser.add_argument(
         "inputs",
@@ -39,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        default="report-site",
-        help="Output directory for the generated static site (default: report-site)",
+        default="report.md",
+        help="Output Markdown file path (default: report.md)",
     )
     return parser.parse_args()
 
@@ -131,7 +141,7 @@ def extract_summary(text: str) -> str:
 
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
-        if stripped.startswith("```"):
+        if stripped.startswith(("```", "~~~")):
             in_code = not in_code
             continue
         if in_code:
@@ -144,7 +154,11 @@ def extract_summary(text: str) -> str:
             continue
         if stripped.startswith("|"):
             continue
-        if re.match(r"^(?:[-*]\s*)?(severity|risk|impact|component|affected component|affected area)\s*[:|-]", stripped, re.I):
+        if re.match(
+            r"^(?:[-*]\s*)?(severity|risk|impact|component|affected component|affected area)\s*[:|-]",
+            stripped,
+            re.I,
+        ):
             continue
         paragraph.append(clean_inline_markdown(stripped.lstrip("-* ").strip()))
 
@@ -161,44 +175,30 @@ def bundle_name(bundle: Path) -> str:
     return bundle.name
 
 
-def artifact_id(bundle: Path, finding_dir: Path) -> str:
-    raw = f"{bundle_name(bundle)}_{finding_dir.name}"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_")
-    return slug or "finding"
+def severity_label(value: str) -> str:
+    if value == "informational":
+        return "Informational"
+    return value.capitalize()
 
 
-def copy_finding_artifacts(
-    finding_dir: Path, output_root: Path, item_id: str
-) -> list[dict[str, str]]:
-    artifact_root = output_root / "artifacts" / item_id
-    artifact_root.mkdir(parents=True, exist_ok=True)
-
-    report_src = finding_dir / "REPORT.md"
-    report_dst = artifact_root / "REPORT.md"
-    shutil.copy2(report_src, report_dst)
-
-    patch_src = finding_dir / "patch.diff"
-    if patch_src.is_file():
-        shutil.copy2(patch_src, artifact_root / "patch.diff")
-
-    poc_src = finding_dir / "poc"
-    if poc_src.is_dir():
-        shutil.copytree(poc_src, artifact_root / "poc", dirs_exist_ok=True)
-
+def collect_artifact_links(finding_dir: Path) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
-    for path in sorted(artifact_root.rglob("*")):
+
+    for path in sorted(finding_dir.rglob("*")):
         if path.is_file():
+            resolved = path.resolve()
             links.append(
                 {
-                    "label": str(path.relative_to(artifact_root)).replace("\\", "/"),
-                    "href": str(path.relative_to(output_root)).replace("\\", "/"),
+                    "label": str(path.relative_to(finding_dir)).replace("\\", "/"),
+                    "path": str(resolved),
+                    "href": resolved.as_uri(),
                 }
             )
 
     return links
 
 
-def collect_findings(bundles: list[Path], output_root: Path) -> list[dict[str, object]]:
+def collect_findings(bundles: list[Path]) -> list[dict[str, object]]:
     findings: list[dict[str, object]] = []
 
     for bundle in bundles:
@@ -210,25 +210,22 @@ def collect_findings(bundles: list[Path], output_root: Path) -> list[dict[str, o
             text = report_path.read_text(encoding="utf-8", errors="replace")
             severity_field = extract_field(text, FIELD_NAME_RE["severity"])
             severity = normalize_severity(severity_field, text)
-            component = extract_field(text, FIELD_NAME_RE["component"]) or "Unspecified component"
-            title = extract_title(text, finding_dir.name.replace("_", " "))
-            summary = extract_summary(text)
-            item_id = artifact_id(bundle, finding_dir)
-            links = copy_finding_artifacts(finding_dir, output_root, item_id)
-
+            component = (
+                extract_field(text, FIELD_NAME_RE["component"])
+                or "Unspecified component"
+            )
             findings.append(
                 {
-                    "id": item_id,
                     "bundle": bundle_name(bundle),
                     "bundlePath": str(bundle.resolve()),
-                    "title": title,
+                    "title": extract_title(text, finding_dir.name.replace("_", " ")),
                     "severity": severity,
                     "severityRank": SEVERITY_ORDER[severity],
                     "component": component,
-                    "summary": summary,
-                    "reportBody": text,
+                    "summary": extract_summary(text),
+                    "reportBody": text.rstrip(),
                     "reportPath": str(report_path.resolve()),
-                    "artifactLinks": links,
+                    "artifactLinks": collect_artifact_links(finding_dir),
                 }
             )
 
@@ -242,655 +239,223 @@ def collect_findings(bundles: list[Path], output_root: Path) -> list[dict[str, o
     return findings
 
 
-def render_index(findings: list[dict[str, object]], bundle_count: int) -> str:
-    payload = {
-        "bundleCount": bundle_count,
-        "findingCount": len(findings),
-        "findings": findings,
-    }
-    data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Carlini Final Reports</title>
-  <style>
-    :root {{
-      --bg: #f4efe4;
-      --panel: rgba(255, 252, 246, 0.92);
-      --panel-strong: #fffaf1;
-      --line: #d8cbb3;
-      --ink: #1d2c2b;
-      --muted: #5c6966;
-      --accent: #0e6a62;
-      --accent-soft: rgba(14, 106, 98, 0.12);
-      --critical: #8b1e26;
-      --high: #b44b1c;
-      --medium: #9b7c18;
-      --low: #3a7a47;
-      --informational: #486d8d;
-      --unknown: #727272;
-      --shadow: 0 18px 48px rgba(48, 41, 29, 0.12);
-      --radius: 20px;
-      --radius-sm: 14px;
-      --mono: "SFMono-Regular", "Menlo", "Monaco", monospace;
-      --sans: "Avenir Next", "Trebuchet MS", sans-serif;
-      --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
-    }}
-
-    * {{
-      box-sizing: border-box;
-    }}
-
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(14, 106, 98, 0.16), transparent 30%),
-        radial-gradient(circle at top right, rgba(180, 75, 28, 0.18), transparent 28%),
-        linear-gradient(180deg, #f7f2e8 0%, var(--bg) 100%);
-      font-family: var(--serif);
-    }}
-
-    .shell {{
-      width: min(1440px, calc(100vw - 32px));
-      margin: 24px auto;
-      display: grid;
-      grid-template-columns: minmax(320px, 430px) minmax(0, 1fr);
-      gap: 20px;
-    }}
-
-    .panel {{
-      background: var(--panel);
-      border: 1px solid rgba(216, 203, 179, 0.9);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }}
-
-    .sidebar {{
-      padding: 22px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-      min-height: calc(100vh - 48px);
-      position: sticky;
-      top: 24px;
-    }}
-
-    .hero {{
-      padding: 18px 18px 20px;
-      border-radius: var(--radius-sm);
-      background:
-        linear-gradient(135deg, rgba(14, 106, 98, 0.16), rgba(255, 250, 241, 0.7)),
-        linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(255, 250, 241, 0.95));
-      border: 1px solid rgba(14, 106, 98, 0.18);
-    }}
-
-    .eyebrow {{
-      font-family: var(--sans);
-      font-size: 12px;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-      color: var(--accent);
-      margin-bottom: 10px;
-    }}
-
-    h1, h2, h3 {{
-      margin: 0;
-      line-height: 1.05;
-      font-weight: 700;
-    }}
-
-    h1 {{
-      font-size: clamp(32px, 4vw, 48px);
-      margin-bottom: 10px;
-    }}
-
-    .hero p,
-    .muted {{
-      margin: 0;
-      color: var(--muted);
-      font-family: var(--sans);
-      line-height: 1.5;
-    }}
-
-    .stats {{
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-    }}
-
-    .stat {{
-      padding: 14px;
-      border-radius: var(--radius-sm);
-      background: rgba(255, 255, 255, 0.7);
-      border: 1px solid rgba(216, 203, 179, 0.8);
-    }}
-
-    .stat strong {{
-      display: block;
-      font-family: var(--sans);
-      font-size: 28px;
-      line-height: 1;
-      margin-bottom: 6px;
-    }}
-
-    .stat span {{
-      font-family: var(--sans);
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-    }}
-
-    .controls {{
-      display: grid;
-      gap: 12px;
-    }}
-
-    .search {{
-      width: 100%;
-      padding: 14px 16px;
-      border-radius: 999px;
-      border: 1px solid rgba(14, 106, 98, 0.22);
-      background: rgba(255, 255, 255, 0.82);
-      color: var(--ink);
-      font-family: var(--sans);
-      font-size: 15px;
-      outline: none;
-      transition: border-color 120ms ease, box-shadow 120ms ease;
-    }}
-
-    .search:focus {{
-      border-color: var(--accent);
-      box-shadow: 0 0 0 4px rgba(14, 106, 98, 0.12);
-    }}
-
-    .filter-row {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
-
-    .filter {{
-      border: 1px solid rgba(216, 203, 179, 0.96);
-      background: rgba(255, 255, 255, 0.74);
-      color: var(--muted);
-      border-radius: 999px;
-      padding: 8px 12px;
-      font-family: var(--sans);
-      font-size: 13px;
-      cursor: pointer;
-      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
-    }}
-
-    .filter:hover {{
-      transform: translateY(-1px);
-    }}
-
-    .filter.active {{
-      background: var(--accent);
-      color: white;
-      border-color: transparent;
-    }}
-
-    .findings {{
-      display: grid;
-      gap: 10px;
-      min-height: 0;
-      overflow: auto;
-      padding-right: 2px;
-    }}
-
-    .card {{
-      padding: 16px;
-      border-radius: var(--radius-sm);
-      border: 1px solid rgba(216, 203, 179, 0.9);
-      background: rgba(255, 255, 255, 0.8);
-      cursor: pointer;
-      transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
-    }}
-
-    .card:hover {{
-      transform: translateY(-2px);
-      box-shadow: 0 10px 24px rgba(48, 41, 29, 0.08);
-    }}
-
-    .card.selected {{
-      border-color: rgba(14, 106, 98, 0.55);
-      box-shadow: 0 12px 28px rgba(14, 106, 98, 0.12);
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(240, 250, 248, 0.92));
-    }}
-
-    .card-top,
-    .detail-meta {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-    }}
-
-    .badge {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-family: var(--sans);
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: white;
-    }}
-
-    .critical {{ background: var(--critical); }}
-    .high {{ background: var(--high); }}
-    .medium {{ background: var(--medium); }}
-    .low {{ background: var(--low); }}
-    .informational {{ background: var(--informational); }}
-    .unknown {{ background: var(--unknown); }}
-
-    .repo {{
-      font-family: var(--mono);
-      font-size: 12px;
-      color: var(--muted);
-    }}
-
-    .card h3 {{
-      margin-top: 12px;
-      font-size: 24px;
-    }}
-
-    .summary {{
-      margin-top: 10px;
-      color: var(--muted);
-      font-family: var(--sans);
-      line-height: 1.55;
-    }}
-
-    .component {{
-      margin-top: 12px;
-      font-family: var(--sans);
-      font-size: 13px;
-      color: var(--ink);
-    }}
-
-    .detail {{
-      min-height: calc(100vh - 48px);
-      padding: 28px;
-      display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
-      gap: 22px;
-    }}
-
-    .detail-header {{
-      display: grid;
-      gap: 14px;
-    }}
-
-    .detail h2 {{
-      font-size: clamp(28px, 3vw, 42px);
-    }}
-
-    .detail-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-    }}
-
-    .info-box {{
-      padding: 16px;
-      border-radius: var(--radius-sm);
-      background: var(--panel-strong);
-      border: 1px solid rgba(216, 203, 179, 0.9);
-    }}
-
-    .info-box strong {{
-      display: block;
-      margin-bottom: 8px;
-      font-family: var(--sans);
-      font-size: 12px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-    }}
-
-    .info-box span,
-    .info-box a {{
-      color: var(--ink);
-      font-family: var(--sans);
-      line-height: 1.5;
-      word-break: break-word;
-    }}
-
-    .info-box a {{
-      color: var(--accent);
-    }}
-
-    .detail-main {{
-      display: grid;
-      grid-template-columns: minmax(0, 1.4fr) minmax(240px, 0.8fr);
-      gap: 16px;
-      min-height: 0;
-    }}
-
-    .report-shell,
-    .artifacts {{
-      min-height: 0;
-      border-radius: var(--radius);
-      border: 1px solid rgba(216, 203, 179, 0.9);
-      background: rgba(255, 255, 255, 0.76);
-      overflow: hidden;
-    }}
-
-    .section-head {{
-      padding: 14px 16px;
-      border-bottom: 1px solid rgba(216, 203, 179, 0.84);
-      font-family: var(--sans);
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      font-size: 12px;
-      color: var(--muted);
-      background: rgba(255, 250, 241, 0.9);
-    }}
-
-    pre {{
-      margin: 0;
-      padding: 18px;
-      font-family: var(--mono);
-      font-size: 13px;
-      line-height: 1.6;
-      color: var(--ink);
-      white-space: pre-wrap;
-      overflow: auto;
-    }}
-
-    .artifact-list {{
-      margin: 0;
-      padding: 12px;
-      display: grid;
-      gap: 8px;
-      max-height: 100%;
-      overflow: auto;
-    }}
-
-    .artifact-link {{
-      display: block;
-      padding: 12px 14px;
-      border-radius: 12px;
-      background: rgba(14, 106, 98, 0.06);
-      color: var(--ink);
-      text-decoration: none;
-      border: 1px solid rgba(14, 106, 98, 0.12);
-      font-family: var(--mono);
-      font-size: 13px;
-    }}
-
-    .artifact-link:hover {{
-      background: rgba(14, 106, 98, 0.1);
-    }}
-
-    .empty {{
-      padding: 24px;
-      border-radius: var(--radius-sm);
-      border: 1px dashed rgba(216, 203, 179, 0.96);
-      color: var(--muted);
-      font-family: var(--sans);
-      text-align: center;
-    }}
-
-    @media (max-width: 980px) {{
-      .shell {{
-        grid-template-columns: 1fr;
-      }}
-
-      .sidebar,
-      .detail {{
-        min-height: auto;
-        position: static;
-      }}
-
-      .detail-main,
-      .detail-grid {{
-        grid-template-columns: 1fr;
-      }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <aside class="panel sidebar">
-      <section class="hero">
-        <div class="eyebrow">Maintainer Ready</div>
-        <h1>Final Reports</h1>
-        <p>Navigate the accepted findings across every generated report bundle, sorted by severity and ready for a deeper read.</p>
-      </section>
-
-      <section class="stats" id="stats"></section>
-
-      <section class="controls">
-        <input id="search" class="search" type="search" placeholder="Search title, repo, component, summary">
-        <div class="filter-row" id="filters"></div>
-        <p class="muted" id="resultCount"></p>
-      </section>
-
-      <section class="findings" id="findingList"></section>
-    </aside>
-
-    <main class="panel detail">
-      <section class="detail-header" id="detailHeader"></section>
-      <section class="detail-grid" id="detailGrid"></section>
-      <section class="detail-main">
-        <article class="report-shell">
-          <div class="section-head">Report</div>
-          <pre id="reportBody"></pre>
-        </article>
-        <aside class="artifacts">
-          <div class="section-head">Artifacts</div>
-          <div class="artifact-list" id="artifactList"></div>
-        </aside>
-      </section>
-    </main>
-  </div>
-
-  <script id="report-data" type="application/json">{data}</script>
-  <script>
-    const payload = JSON.parse(document.getElementById("report-data").textContent);
-    const severities = ["all", "critical", "high", "medium", "low", "informational", "unknown"];
-    const state = {{
-      query: "",
-      severity: "all",
-      selectedId: payload.findings.length ? payload.findings[0].id : null
-    }};
-
-    const statsNode = document.getElementById("stats");
-    const filtersNode = document.getElementById("filters");
-    const listNode = document.getElementById("findingList");
-    const countNode = document.getElementById("resultCount");
-    const detailHeaderNode = document.getElementById("detailHeader");
-    const detailGridNode = document.getElementById("detailGrid");
-    const reportBodyNode = document.getElementById("reportBody");
-    const artifactListNode = document.getElementById("artifactList");
-    const searchNode = document.getElementById("search");
-
-    function titleCase(value) {{
-      if (value === "all") return "All";
-      if (value === "informational") return "Info";
-      return value.charAt(0).toUpperCase() + value.slice(1);
-    }}
-
-    function countBySeverity(level) {{
-      return payload.findings.filter((item) => item.severity === level).length;
-    }}
-
-    function renderStats() {{
-      const topSeverity = payload.findings.length ? titleCase(payload.findings[0].severity) : "None";
-      const stats = [
-        {{ value: payload.bundleCount, label: "Bundles" }},
-        {{ value: payload.findingCount, label: "Findings" }},
-        {{ value: topSeverity, label: "Top Severity" }}
-      ];
-
-      statsNode.innerHTML = stats.map((stat) => `
-        <div class="stat">
-          <strong>${{stat.value}}</strong>
-          <span>${{stat.label}}</span>
-        </div>
-      `).join("");
-    }}
-
-    function renderFilters() {{
-      filtersNode.innerHTML = severities.map((level) => {{
-        const count = level === "all" ? payload.findingCount : countBySeverity(level);
-        const active = state.severity === level ? "active" : "";
-        return `<button class="filter ${{active}}" data-severity="${{level}}">${{titleCase(level)}} · ${{count}}</button>`;
-      }}).join("");
-
-      for (const button of filtersNode.querySelectorAll(".filter")) {{
-        button.addEventListener("click", () => {{
-          state.severity = button.dataset.severity;
-          render();
-        }});
-      }}
-    }}
-
-    function filteredFindings() {{
-      const query = state.query.trim().toLowerCase();
-      return payload.findings.filter((item) => {{
-        const severityMatch = state.severity === "all" || item.severity === state.severity;
-        if (!severityMatch) return false;
-        if (!query) return true;
-        const haystack = [
-          item.title,
-          item.bundle,
-          item.component,
-          item.summary
-        ].join(" ").toLowerCase();
-        return haystack.includes(query);
-      }});
-    }}
-
-    function renderList(items) {{
-      countNode.textContent = `${{items.length}} finding${{items.length === 1 ? "" : "s"}} visible`;
-
-      if (!items.length) {{
-        listNode.innerHTML = '<div class="empty">No findings match the current filters.</div>';
-        return;
-      }}
-
-      if (!items.some((item) => item.id === state.selectedId)) {{
-        state.selectedId = items[0].id;
-      }}
-
-      listNode.innerHTML = items.map((item) => {{
-        const selected = item.id === state.selectedId ? "selected" : "";
-        return `
-          <article class="card ${{selected}}" data-id="${{item.id}}">
-            <div class="card-top">
-              <span class="badge ${{item.severity}}">${{titleCase(item.severity)}}</span>
-              <span class="repo">${{item.bundle}}</span>
-            </div>
-            <h3>${{item.title}}</h3>
-            <p class="summary">${{item.summary}}</p>
-            <div class="component">${{item.component}}</div>
-          </article>
-        `;
-      }}).join("");
-
-      for (const card of listNode.querySelectorAll(".card")) {{
-        card.addEventListener("click", () => {{
-          state.selectedId = card.dataset.id;
-          render();
-        }});
-      }}
-    }}
-
-    function renderDetail(item) {{
-      if (!item) {{
-        detailHeaderNode.innerHTML = '<div class="empty">No accepted findings were found.</div>';
-        detailGridNode.innerHTML = "";
-        reportBodyNode.textContent = "";
-        artifactListNode.innerHTML = '<div class="empty">No artifacts copied.</div>';
-        return;
-      }}
-
-      detailHeaderNode.innerHTML = `
-        <div class="detail-meta">
-          <span class="badge ${{item.severity}}">${{titleCase(item.severity)}}</span>
-          <span class="repo">${{item.bundle}}</span>
-        </div>
-        <h2>${{item.title}}</h2>
-        <p class="muted">${{item.summary}}</p>
-      `;
-
-      detailGridNode.innerHTML = `
-        <div class="info-box">
-          <strong>Component</strong>
-          <span>${{item.component}}</span>
-        </div>
-        <div class="info-box">
-          <strong>Original Report</strong>
-          <span>${{item.reportPath}}</span>
-        </div>
-        <div class="info-box">
-          <strong>Bundle</strong>
-          <span>${{item.bundlePath}}</span>
-        </div>
-        <div class="info-box">
-          <strong>Copied Artifacts</strong>
-          <span>${{item.artifactLinks.length}} file${{item.artifactLinks.length === 1 ? "" : "s"}}</span>
-        </div>
-      `;
-
-      reportBodyNode.textContent = item.reportBody;
-
-      if (!item.artifactLinks.length) {{
-        artifactListNode.innerHTML = '<div class="empty">No artifacts copied for this finding.</div>';
-        return;
-      }}
-
-      artifactListNode.innerHTML = item.artifactLinks.map((link) => `
-        <a class="artifact-link" href="${{link.href}}">${{link.label}}</a>
-      `).join("");
-    }}
-
-    function render() {{
-      renderStats();
-      renderFilters();
-      const items = filteredFindings();
-      renderList(items);
-      renderDetail(items.find((item) => item.id === state.selectedId) || items[0] || null);
-    }}
-
-    searchNode.addEventListener("input", (event) => {{
-      state.query = event.target.value;
-      render();
-    }});
-
-    render();
-  </script>
-</body>
-</html>
-"""
-
-
-def prepare_output_dir(output_root: Path) -> None:
-    output_root.mkdir(parents=True, exist_ok=True)
-    artifacts_dir = output_root / "artifacts"
-    if artifacts_dir.exists():
-        shutil.rmtree(artifacts_dir)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+def shift_markdown_headings(text: str, levels: int) -> str:
+    if levels <= 0:
+        return text
+
+    shifted: list[str] = []
+    in_code = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_code = not in_code
+            shifted.append(line)
+            continue
+
+        if not in_code:
+            match = HEADING_RE.match(line)
+            if match:
+                hashes, rest = match.groups()
+                shifted.append(f"{'#' * min(6, len(hashes) + levels)}{rest}")
+                continue
+
+        shifted.append(line)
+
+    return "\n".join(shifted)
+
+
+def resolve_output_path(raw_output: str) -> Path:
+    output = Path(raw_output).expanduser()
+    if output.exists() and output.is_dir():
+        return output / "report.md"
+    if output.suffix.lower() == ".md":
+        return output
+    return output.parent / f"{output.name}.md"
+
+
+def escape_table_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def render_table(headers: list[str], rows: list[list[object]]) -> str:
+    rendered_rows = [[escape_table_cell(cell) for cell in row] for row in rows]
+    widths = [len(header) for header in headers]
+
+    for row in rendered_rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def format_row(values: list[str]) -> str:
+        return "| " + " | ".join(
+            value.ljust(widths[index]) for index, value in enumerate(values)
+        ) + " |"
+
+    separator = "| " + " | ".join("-" * width for width in widths) + " |"
+    return "\n".join(
+        [format_row(headers), separator, *(format_row(row) for row in rendered_rows)]
+    )
+
+
+def render_snapshot(findings: list[dict[str, object]], bundle_count: int) -> str:
+    top_severity = severity_label(findings[0]["severity"]) if findings else "None"
+    generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    return "\n".join(
+        [
+            "## Snapshot",
+            "",
+            f"- Bundles: **{bundle_count}**",
+            f"- Findings: **{len(findings)}**",
+            f"- Top Severity: **{top_severity}**",
+            f"- Generated: **{generated_at}**",
+        ]
+    )
+
+
+def render_severity_breakdown(findings: list[dict[str, object]]) -> str:
+    counts = {level: 0 for level in SEVERITY_LEVELS}
+    for finding in findings:
+        counts[str(finding["severity"])] += 1
+
+    rows = [[severity_label(level), counts[level]] for level in SEVERITY_LEVELS]
+    return "\n".join(
+        [
+            "## Severity Breakdown",
+            "",
+            render_table(["Severity", "Findings"], rows),
+        ]
+    )
+
+
+def render_bundle_summary(findings: list[dict[str, object]]) -> str:
+    bundles: dict[str, dict[str, object]] = {}
+
+    for finding in findings:
+        bundle = str(finding["bundle"])
+        entry = bundles.setdefault(
+            bundle,
+            {
+                "count": 0,
+                "topRank": SEVERITY_ORDER["unknown"],
+                "topSeverity": "unknown",
+            },
+        )
+        entry["count"] += 1
+        if int(finding["severityRank"]) < int(entry["topRank"]):
+            entry["topRank"] = finding["severityRank"]
+            entry["topSeverity"] = finding["severity"]
+
+    rows = [
+        [bundle, data["count"], severity_label(str(data["topSeverity"]))]
+        for bundle, data in sorted(
+            bundles.items(),
+            key=lambda item: (int(item[1]["topRank"]), item[0].lower()),
+        )
+    ]
+
+    if not rows:
+        rows = [["None", 0, "None"]]
+
+    return "\n".join(
+        [
+            "## Bundle Summary",
+            "",
+            render_table(["Bundle", "Findings", "Highest Severity"], rows),
+        ]
+    )
+
+
+def render_finding_index(findings: list[dict[str, object]]) -> str:
+    rows = [
+        [
+            index,
+            severity_label(str(finding["severity"])),
+            finding["bundle"],
+            finding["title"],
+        ]
+        for index, finding in enumerate(findings, start=1)
+    ]
+
+    if not rows:
+        rows = [["-", "None", "-", "No accepted findings were found"]]
+
+    return "\n".join(
+        [
+            "## Finding Index",
+            "",
+            render_table(["#", "Severity", "Bundle", "Title"], rows),
+        ]
+    )
+
+
+def render_artifact_list(links: list[dict[str, str]]) -> str:
+    if not links:
+        return "No source artifacts found."
+
+    return "\n".join(
+        f"- [{link['label']}]({link['href']}) - `{link['path']}`" for link in links
+    )
+
+
+def render_findings(findings: list[dict[str, object]]) -> str:
+    if not findings:
+        return "\n".join(["## Findings", "", "No accepted findings were found."])
+
+    sections = ["## Findings"]
+
+    for index, finding in enumerate(findings, start=1):
+        report_body = shift_markdown_headings(str(finding["reportBody"]), 3).strip()
+        sections.extend(
+            [
+                "",
+                f"### {index}. {finding['title']}",
+                "",
+                f"- Severity: **{severity_label(str(finding['severity']))}**",
+                f"- Bundle: `{finding['bundle']}`",
+                f"- Component: {finding['component']}",
+                f"- Summary: {finding['summary']}",
+                f"- Original Report: `{finding['reportPath']}`",
+                f"- Bundle Path: `{finding['bundlePath']}`",
+                "",
+                "#### Artifacts",
+                "",
+                render_artifact_list(finding["artifactLinks"]),
+                "",
+                "#### Full Report",
+                "",
+                report_body or "_Empty report body._",
+                "",
+                "---",
+            ]
+        )
+
+    return "\n".join(sections).rstrip()
+
+
+def render_report(findings: list[dict[str, object]], bundle_count: int) -> str:
+    parts = [
+        "# Carlini Final Reports",
+        "",
+        "Maintainer-ready summary of accepted findings across the discovered report bundles.",
+        "",
+        render_snapshot(findings, bundle_count),
+        "",
+        render_severity_breakdown(findings),
+        "",
+        render_bundle_summary(findings),
+        "",
+        render_finding_index(findings),
+        "",
+        render_findings(findings),
+        "",
+    ]
+    return "\n".join(parts)
 
 
 def main() -> int:
     args = parse_args()
     inputs = [Path(path).expanduser() for path in args.inputs]
-    output_root = Path(args.output).expanduser()
+    output_path = resolve_output_path(args.output)
 
     try:
         bundles = discover_bundles(inputs)
@@ -898,14 +463,14 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 1
 
-    prepare_output_dir(output_root)
+    findings = collect_findings(bundles)
+    report = render_report(findings, len(bundles))
 
-    findings = collect_findings(bundles, output_root)
-    index_html = render_index(findings, len(bundles))
-    (output_root / "index.html").write_text(index_html, encoding="utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(report, encoding="utf-8")
 
     print(
-        f"Wrote static report site with {len(findings)} findings from {len(bundles)} bundles to {output_root}"
+        f"Wrote Markdown report with {len(findings)} findings from {len(bundles)} bundles to {output_path}"
     )
     return 0
 

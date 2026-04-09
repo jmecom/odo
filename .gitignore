@@ -1,3 +1,5 @@
-REPOS*
+*REPOS*
 remote-bughunt
 __pycache__
+bughunt-reports
+.DS_Store
