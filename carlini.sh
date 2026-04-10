@@ -4,6 +4,7 @@
 # Usage: ./carlini.sh [options] [repo_dir]
 #   ./carlini.sh .
 #   ./carlini.sh --codex-only .
+#   ./carlini.sh --claude-only .
 #   ./carlini.sh --source-set "c,h,rs" .
 #   ./carlini.sh --exclude "vendor/**,third-party/**" .
 #   JOBS=8 ./carlini.sh .
@@ -17,11 +18,16 @@ MAX_FILES=""
 PRIORITIZE=""
 REPO=""
 CODEX_ONLY=0
+CLAUDE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
   --codex-only)
     CODEX_ONLY=1
+    shift
+    ;;
+  --claude-only)
+    CLAUDE_ONLY=1
     shift
     ;;
   --source-set)
@@ -52,6 +58,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO="${REPO:-.}"
+if [[ "$CODEX_ONLY" -eq 1 && "$CLAUDE_ONLY" -eq 1 ]]; then
+  echo "Pass only one of --codex-only or --claude-only" >&2
+  exit 1
+fi
+
 JOBS="${JOBS:-4}"
 OUTDIR="${OUTDIR:-.vuln-reports}"
 REPORT_DIR="${REPORT_DIR:-$OUTDIR/REPORT}"
@@ -202,10 +213,12 @@ require_cli_tools() {
     echo "jq required: brew install jq" >&2
     exit 1
   }
-  command -v codex &>/dev/null || {
-    echo "codex CLI required in PATH" >&2
-    exit 1
-  }
+  if [[ "$CLAUDE_ONLY" -eq 0 ]]; then
+    command -v codex &>/dev/null || {
+      echo "codex CLI required in PATH (or pass --claude-only)" >&2
+      exit 1
+    }
+  fi
   if [[ "$CODEX_ONLY" -eq 0 ]]; then
     command -v claude &>/dev/null || {
       echo "claude CLI required in PATH (or pass --codex-only)" >&2
@@ -230,12 +243,20 @@ run_codex_exec() {
     "$prompt"
 }
 
-run_claude_slot_prompt() {
-  local prompt="$1" sf="$2"
+run_claude_exec() {
+  local prompt="$1"
+  shift || true
 
   claude -p "$prompt" \
     --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
     --dangerously-skip-permissions \
+    "$@"
+}
+
+run_claude_slot_prompt() {
+  local prompt="$1" sf="$2"
+
+  run_claude_exec "$prompt" \
     --output-format stream-json --verbose 2>/dev/null |
     jq --unbuffered -r "$JQ_TOOLS" 2>/dev/null |
     while IFS=$'\t' read -r tool detail; do
@@ -633,15 +654,20 @@ The PoC must be concrete and verifiable — a reviewer should be able to clone t
   echo "IDLE" >"$sf"
 }
 
-run_final_codex_review() {
+run_final_provider_review() {
   local canonical_list="$1"
-  local report_dir_abs report_parent report_tmp codex_last prompt
+  local report_dir_abs report_parent report_tmp provider_label provider_last prompt
 
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.report.tmp.XXXXXX")
-  codex_last="$OUTDIR_ABS/codex-final-review.md"
+  provider_label="Codex"
+  provider_last="$OUTDIR_ABS/codex-final-review.md"
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    provider_label="Claude"
+    provider_last="$OUTDIR_ABS/claude-final-review.md"
+  fi
 
 prompt=$(cat <<EOF
 You are the final maintainer-facing reviewer for a vulnerability audit.
@@ -685,15 +711,30 @@ Requirements:
 EOF
 )
 
-  echo "=== Phase 5: Codex final review ==="
-  echo "    Reviewing canonical findings and PoCs with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+  echo "=== Phase 5: Final review ==="
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    echo "    Reviewing canonical findings and PoCs with Claude ($MODEL)..."
+  else
+    echo "    Reviewing canonical findings and PoCs with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+  fi
 
-  if run_codex_exec "$prompt" -o "$codex_last"; then
-    if [[ ! -f "$report_tmp/README.md" ]]; then
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    if run_claude_exec "$prompt" >"$provider_last" 2>/dev/null; then
+      :
+    else
       rm -rf "$report_tmp"
-      echo "    Codex final review did not create $report_tmp/README.md" >&2
+      echo "    $provider_label final review failed. Last message: $provider_last" >&2
       return 1
     fi
+  elif run_codex_exec "$prompt" -o "$provider_last"; then
+    :
+  else
+    rm -rf "$report_tmp"
+    echo "    $provider_label final review failed. Last message: $provider_last" >&2
+    return 1
+  fi
+
+  if [[ -f "$report_tmp/README.md" ]]; then
     if [[ -e "$report_dir_abs" ]]; then
       rm -rf "$report_dir_abs"
     fi
@@ -701,7 +742,7 @@ EOF
     echo "    Final maintainer bundle written to $report_dir_abs"
   else
     rm -rf "$report_tmp"
-    echo "    Codex final review failed. Last message: $codex_last" >&2
+    echo "    $provider_label final review did not create $report_tmp/README.md" >&2
     return 1
   fi
 
@@ -709,7 +750,7 @@ EOF
 }
 
 run_final_exploitability_review() {
-  local report_dir_abs report_parent report_tmp codex_last prompt
+  local report_dir_abs report_parent report_tmp provider_label provider_last prompt
 
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
@@ -721,7 +762,12 @@ run_final_exploitability_review() {
 
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.exploitability.tmp.XXXXXX")
-  codex_last="$OUTDIR_ABS/codex-exploitability-review.md"
+  provider_label="Codex"
+  provider_last="$OUTDIR_ABS/codex-exploitability-review.md"
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    provider_label="Claude"
+    provider_last="$OUTDIR_ABS/claude-exploitability-review.md"
+  fi
 
   cp -R "$report_dir_abs"/. "$report_tmp"/
 
@@ -775,21 +821,36 @@ Requirements:
 - Ensure the bundle remains self-contained and README.md still exists when you finish.
 EOF
 
-  echo "=== Phase 6: Codex exploitability review ==="
-  echo "    Pressure-testing severity and exploitability stories with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+  echo "=== Phase 6: Exploitability review ==="
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    echo "    Pressure-testing severity and exploitability stories with Claude ($MODEL)..."
+  else
+    echo "    Pressure-testing severity and exploitability stories with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+  fi
 
-  if run_codex_exec "$prompt" -o "$codex_last"; then
-    if [[ ! -f "$report_tmp/README.md" ]]; then
+  if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
+    if run_claude_exec "$prompt" >"$provider_last" 2>/dev/null; then
+      :
+    else
       rm -rf "$report_tmp"
-      echo "    Codex exploitability review did not preserve $report_tmp/README.md" >&2
+      echo "    $provider_label exploitability review failed. Last message: $provider_last" >&2
       return 1
     fi
+  elif run_codex_exec "$prompt" -o "$provider_last"; then
+    :
+  else
+    rm -rf "$report_tmp"
+    echo "    $provider_label exploitability review failed. Last message: $provider_last" >&2
+    return 1
+  fi
+
+  if [[ -f "$report_tmp/README.md" ]]; then
     rm -rf "$report_dir_abs"
     mv "$report_tmp" "$report_dir_abs"
     echo "    Final maintainer bundle updated with exploitability review at $report_dir_abs"
   else
     rm -rf "$report_tmp"
-    echo "    Codex exploitability review failed. Last message: $codex_last" >&2
+    echo "    $provider_label exploitability review did not preserve $report_tmp/README.md" >&2
     return 1
   fi
 
@@ -826,7 +887,7 @@ run_workers poc_worker "Phase 4: PoC" "$poc_total"
 
 # Phase 5: Final maintainer review
 build_canonical_verified_queue "$STATUS_DIR/canonical_verified.txt"
-run_final_codex_review "$STATUS_DIR/canonical_verified.txt"
+run_final_provider_review "$STATUS_DIR/canonical_verified.txt"
 
 # Phase 6: Final exploitability sanity review
 run_final_exploitability_review
