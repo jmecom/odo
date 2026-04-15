@@ -5,11 +5,27 @@
 #   ./carlini.sh .
 #   ./carlini.sh --codex-only .
 #   ./carlini.sh --claude-only .
+#   ./carlini.sh --claude-only --codex-smart-files .
+#   ./carlini.sh --preserve-model-params .
 #   ./carlini.sh --source-set "c,h,rs" .
 #   ./carlini.sh --exclude "vendor/**,third-party/**" .
 #   JOBS=8 ./carlini.sh .
 
 set -euo pipefail
+
+MODEL_WAS_SET=0
+MAX_TURNS_WAS_SET=0
+CLAUDE_EFFORT_WAS_SET=0
+CODEX_MODEL_WAS_SET=0
+CODEX_REASONING_EFFORT_WAS_SET=0
+CODEX_SERVICE_TIER_WAS_SET=0
+
+[[ -n "${MODEL+x}" ]] && MODEL_WAS_SET=1
+[[ -n "${MAX_TURNS+x}" ]] && MAX_TURNS_WAS_SET=1
+[[ -n "${CLAUDE_EFFORT+x}" ]] && CLAUDE_EFFORT_WAS_SET=1
+[[ -n "${CODEX_MODEL+x}" ]] && CODEX_MODEL_WAS_SET=1
+[[ -n "${CODEX_REASONING_EFFORT+x}" ]] && CODEX_REASONING_EFFORT_WAS_SET=1
+[[ -n "${CODEX_SERVICE_TIER+x}" ]] && CODEX_SERVICE_TIER_WAS_SET=1
 
 DEFAULT_EXTS="c,h,cc,cpp,rs,go,py,js,ts,java,rb,php,swift,kt,zig"
 SOURCE_SET=""
@@ -19,6 +35,8 @@ PRIORITIZE=""
 REPO=""
 CODEX_ONLY=0
 CLAUDE_ONLY=0
+CODEX_SMART_FILES=0
+PRESERVE_MODEL_PARAMS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +46,14 @@ while [[ $# -gt 0 ]]; do
     ;;
   --claude-only)
     CLAUDE_ONLY=1
+    shift
+    ;;
+  --codex-smart-files)
+    CODEX_SMART_FILES=1
+    shift
+    ;;
+  --preserve-model-params | --keep-model-params)
+    PRESERVE_MODEL_PARAMS=1
     shift
     ;;
   --source-set)
@@ -67,7 +93,11 @@ JOBS="${JOBS:-4}"
 OUTDIR="${OUTDIR:-.vuln-reports}"
 REPORT_DIR="${REPORT_DIR:-$OUTDIR/REPORT}"
 MODEL="${MODEL:-opus}"
+CLAUDE_EFFORT="${CLAUDE_EFFORT:-max}"
 MAX_TURNS="${MAX_TURNS:-25}"
+CLAUDE_RATE_LIMIT_MAX_RETRIES="${CLAUDE_RATE_LIMIT_MAX_RETRIES:-6}"
+CLAUDE_RATE_LIMIT_BACKOFF_SECONDS="${CLAUDE_RATE_LIMIT_BACKOFF_SECONDS:-15}"
+CLAUDE_RATE_LIMIT_MAX_BACKOFF_SECONDS="${CLAUDE_RATE_LIMIT_MAX_BACKOFF_SECONDS:-120}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.4}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-xhigh}"
 CODEX_SERVICE_TIER="${CODEX_SERVICE_TIER:-fast}"
@@ -181,6 +211,51 @@ build_canonical_verified_queue() {
   done < <(find "$OUTDIR" -name "*.verified.md" -type f 2>/dev/null | sort)
 }
 
+fingerprint_stream() {
+  cksum | awk '{print $1 ":" $2}'
+}
+
+compute_final_review_inputs_fingerprint() {
+  local canonical_list="$1"
+  local verified vuln poc
+
+  {
+    [[ -f "$canonical_list" ]] && cksum "$canonical_list"
+    [[ -f "$OUTDIR_ABS/SUMMARY.md" ]] && cksum "$OUTDIR_ABS/SUMMARY.md"
+    [[ -f "$OUTDIR_ABS/duplicates.txt" ]] && cksum "$OUTDIR_ABS/duplicates.txt"
+
+    while IFS= read -r verified; do
+      [[ -n "$verified" ]] || continue
+      [[ -f "$verified" ]] && cksum "$verified"
+
+      vuln="${verified%.verified.md}.vuln.md"
+      [[ -f "$vuln" ]] && cksum "$vuln"
+
+      poc="${verified%.verified.md}.poc"
+      if [[ -d "$poc" ]]; then
+        while IFS= read -r poc_file; do
+          cksum "$poc_file"
+        done < <(find "$poc" -type f 2>/dev/null | sort)
+      fi
+    done < "$canonical_list"
+  } | fingerprint_stream
+}
+
+compute_report_dir_fingerprint() {
+  local report_dir="$1"
+
+  {
+    while IFS= read -r report_file; do
+      cksum "$report_file"
+    done < <(
+      find "$report_dir" -type f 2>/dev/null \
+        ! -name '.final-review-inputs.cksum' \
+        ! -name '.exploitability-review-complete' \
+        ! -name '.exploitability-review-inputs.cksum' | sort
+    )
+  } | fingerprint_stream
+}
+
 JQ_TOOLS='
   select(.type == "assistant") |
   .message.content[]? |
@@ -213,9 +288,9 @@ require_cli_tools() {
     echo "jq required: brew install jq" >&2
     exit 1
   }
-  if [[ "$CLAUDE_ONLY" -eq 0 ]]; then
+  if [[ "$CLAUDE_ONLY" -eq 0 || "$CODEX_SMART_FILES" -eq 1 ]]; then
     command -v codex &>/dev/null || {
-      echo "codex CLI required in PATH (or pass --claude-only)" >&2
+      echo "codex CLI required in PATH (or remove --codex-smart-files / pass --claude-only)" >&2
       exit 1
     }
   fi
@@ -227,30 +302,202 @@ require_cli_tools() {
   fi
 }
 
+claude_output_has_fatal_error() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+
+  grep -Eqi \
+    'Invalid API key|Fix external API key|Please log in|Please login|not authenticated|authentication failed|unauthorized|401' \
+    "$file"
+}
+
+claude_output_has_rate_limit_error() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+
+  grep -Eqi \
+    'rate limit|rate_limit_error|too many requests|429|would exceed your organization.s rate limit' \
+    "$file"
+}
+
+first_nonempty_line() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  awk 'NF { print; exit }' "$file"
+}
+
+preflight_claude_cli() {
+  local out="$OUTDIR_ABS/claude-healthcheck.out"
+  local err="$OUTDIR_ABS/claude-healthcheck.stderr"
+  local detail=""
+
+  [[ "$CODEX_ONLY" -eq 0 ]] || return 0
+
+  rm -f "$out" "$err"
+  if ! run_claude_exec_with_turn_limit "Reply with exactly OK." 1 >"$out" 2>"$err"; then
+    detail=$(first_nonempty_line "$err" || true)
+    [[ -n "$detail" ]] || detail=$(first_nonempty_line "$out" || true)
+    if [[ -n "$detail" ]]; then
+      echo "Claude CLI health check failed: $detail" >&2
+    else
+      echo "Claude CLI health check failed. See $out and $err" >&2
+    fi
+    exit 1
+  fi
+
+  if claude_output_has_fatal_error "$out" || claude_output_has_fatal_error "$err"; then
+    detail=$(first_nonempty_line "$out" || true)
+    [[ -n "$detail" ]] || detail=$(first_nonempty_line "$err" || true)
+    if [[ -n "$detail" ]]; then
+      echo "Claude CLI returned an authentication/configuration error: $detail" >&2
+    else
+      echo "Claude CLI returned an authentication/configuration error. See $out and $err" >&2
+    fi
+    exit 1
+  fi
+
+  rm -f "$out" "$err"
+}
+
+describe_claude_model_params() {
+  local parts=()
+
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 1 ]]; then
+    echo "CLI defaults"
+    return
+  fi
+
+  parts+=("model=$MODEL")
+  parts+=("effort=$CLAUDE_EFFORT")
+  parts+=("max-turns=$MAX_TURNS")
+
+  [[ ${#parts[@]} -gt 0 ]] || {
+    echo "CLI defaults"
+    return
+  }
+
+  local IFS=', '
+  echo "${parts[*]}"
+}
+
+describe_codex_model_params() {
+  local parts=()
+
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 1 ]]; then
+    echo "CLI defaults"
+    return
+  fi
+
+  parts+=("model=$CODEX_MODEL")
+  parts+=("reasoning=$CODEX_REASONING_EFFORT")
+  parts+=("service-tier=$CODEX_SERVICE_TIER")
+
+  [[ ${#parts[@]} -gt 0 ]] || {
+    echo "CLI defaults"
+    return
+  }
+
+  local IFS=', '
+  echo "${parts[*]}"
+}
+
 run_codex_exec() {
   local prompt="$1"
   shift || true
+  local cmd=(codex exec --ephemeral -C "$REPO_ROOT")
 
-  codex exec \
-    --ephemeral \
-    -C "$REPO_ROOT" \
-    -m "$CODEX_MODEL" \
-    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
-    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
-    --skip-git-repo-check \
-    --dangerously-bypass-approvals-and-sandbox \
-    "$@" \
-    "$prompt"
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(-m "$CODEX_MODEL")
+  fi
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(-c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"")
+  fi
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(-c "service_tier=\"$CODEX_SERVICE_TIER\"")
+  fi
+
+  cmd+=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)
+  cmd+=("$@")
+  cmd+=("$prompt")
+
+  "${cmd[@]}"
+}
+
+run_claude_exec_with_turn_limit() {
+  local prompt="$1"
+  local turn_limit="$2"
+  shift 2 || true
+  local cmd=(claude -p --input-format text)
+  local attempt=1
+  local out err rc sleep_s detail
+  local max_attempts="$CLAUDE_RATE_LIMIT_MAX_RETRIES"
+  local base_backoff="$CLAUDE_RATE_LIMIT_BACKOFF_SECONDS"
+  local max_backoff="$CLAUDE_RATE_LIMIT_MAX_BACKOFF_SECONDS"
+
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(--model "$MODEL")
+  fi
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(--effort "$CLAUDE_EFFORT")
+  fi
+  if [[ "$PRESERVE_MODEL_PARAMS" -eq 0 ]]; then
+    cmd+=(--max-turns "$turn_limit")
+  fi
+
+  cmd+=(--dangerously-skip-permissions)
+  cmd+=("$@")
+
+  while true; do
+    out=$(mktemp)
+    err=$(mktemp)
+
+    if printf "%s" "$prompt" | "${cmd[@]}" >"$out" 2>"$err"; then
+      cat "$out"
+      cat "$err" >&2
+      rm -f "$out" "$err"
+      return 0
+    fi
+
+    rc=$?
+    if claude_output_has_rate_limit_error "$out" || claude_output_has_rate_limit_error "$err"; then
+      if (( attempt >= max_attempts )); then
+        cat "$out"
+        cat "$err" >&2
+        rm -f "$out" "$err"
+        return "$rc"
+      fi
+
+      sleep_s=$((base_backoff * (1 << (attempt - 1))))
+      if (( sleep_s > max_backoff )); then
+        sleep_s="$max_backoff"
+      fi
+
+      detail=$(first_nonempty_line "$err" || true)
+      [[ -n "$detail" ]] || detail=$(first_nonempty_line "$out" || true)
+      if [[ -n "$detail" ]]; then
+        echo "Claude rate limit hit; retrying in ${sleep_s}s (${attempt}/${max_attempts}). $detail" >&2
+      else
+        echo "Claude rate limit hit; retrying in ${sleep_s}s (${attempt}/${max_attempts})." >&2
+      fi
+
+      rm -f "$out" "$err"
+      sleep "$sleep_s"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    cat "$out"
+    cat "$err" >&2
+    rm -f "$out" "$err"
+    return "$rc"
+  done
 }
 
 run_claude_exec() {
   local prompt="$1"
   shift || true
 
-  claude -p "$prompt" \
-    --model "$MODEL" --effort max --max-turns "$MAX_TURNS" \
-    --dangerously-skip-permissions \
-    "$@"
+  run_claude_exec_with_turn_limit "$prompt" "$MAX_TURNS" "$@"
 }
 
 run_claude_slot_prompt() {
@@ -298,26 +545,25 @@ sanitize_discovery_output() {
 
 run_smart_discovery() {
   local src_count="$1"
-  local provider_label raw_candidates prompt codex_last discovered
+  local provider_label source_list raw_candidates prompt discovery_last discovery_stderr discovered
 
   provider_label="Claude"
-  [[ "$CODEX_ONLY" -eq 1 ]] && provider_label="Codex"
+  [[ "$CODEX_ONLY" -eq 1 || "$CODEX_SMART_FILES" -eq 1 ]] && provider_label="Codex"
 
   echo "=== Phase 0: Smart file discovery ==="
   echo "    Asking $provider_label to identify high-value attack surface files..."
 
   : >"$STATUS_DIR/hunt_queue.raw"
+  source_list="$OUTDIR_ABS/all_sources.txt"
+  raw_candidates="$OUTDIR_ABS/hunt_queue.discovery.raw"
+  rm -f "$raw_candidates"
 
-  if [[ "$CODEX_ONLY" -eq 1 ]]; then
-    raw_candidates="$STATUS_DIR/hunt_queue.codex.raw"
-    codex_last="$OUTDIR_ABS/codex-discovery.md"
-    rm -f "$raw_candidates"
-    prompt=$(cat <<EOF
+  prompt=$(cat <<EOF
 You are a security researcher doing a vulnerability audit of this codebase.
 
 Workspace:
 - Repository root: $REPO_ROOT
-- Complete source file list ($src_count files): $STATUS_DIR/all_sources
+- Complete source file list ($src_count files): $source_list
 - Output file: $raw_candidates
 
 Read the file list and identify the files most likely to contain exploitable vulnerabilities. Prioritize:
@@ -329,32 +575,26 @@ Read the file list and identify the files most likely to contain exploitable vul
 - Files with "unsafe", raw pointer usage, or FFI boundaries
 
 Write ONLY a newline-separated list of file paths, most promising first, to $raw_candidates.
-Do not write commentary, markdown, numbering, or any other output file.
+If you cannot write the file for any reason, output ONLY the newline-separated file paths on stdout with no commentary, markdown, or numbering.
 EOF
 )
-    if run_codex_exec "$prompt" -o "$codex_last" >/dev/null 2>&1 && [[ -f "$raw_candidates" ]]; then
+
+  if [[ "$CODEX_ONLY" -eq 1 || "$CODEX_SMART_FILES" -eq 1 ]]; then
+    discovery_last="$OUTDIR_ABS/codex-discovery.md"
+    if run_codex_exec "$prompt" -o "$discovery_last" >/dev/null 2>&1 && [[ -f "$raw_candidates" ]]; then
       sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" <"$raw_candidates"
     fi
   else
-    claude -p "You are a security researcher doing a vulnerability audit of this codebase.
-
-Here is a list of all $src_count source files in the project:
-
-$(cat "$STATUS_DIR/all_sources")
-
-Identify the files most likely to contain exploitable vulnerabilities. Prioritize:
-- Files handling parsing, deserialization, or untrusted input
-- Crypto implementations and key management
-- Memory management, buffer operations, pointer arithmetic
-- Authentication, authorization, session handling
-- Network protocol handling, IPC, command dispatch
-- Files with \"unsafe\", raw pointer usage, or FFI boundaries
-
-Output ONLY a newline-separated list of file paths, most promising first. No commentary, no markdown, no numbering. Just paths, one per line." \
-      --model "$MODEL" --effort max --max-turns 10 \
-      --dangerously-skip-permissions \
-      2>/dev/null |
-      sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" || true
+    discovery_last="$OUTDIR_ABS/claude-discovery.md"
+    discovery_stderr="$OUTDIR_ABS/claude-discovery.stderr"
+    rm -f "$discovery_stderr"
+    if run_claude_exec_with_turn_limit "$prompt" 10 >"$discovery_last" 2>"$discovery_stderr"; then
+      if [[ -f "$raw_candidates" ]]; then
+        sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" <"$raw_candidates"
+      else
+        sanitize_discovery_output "$STATUS_DIR/hunt_queue.raw" <"$discovery_last" || true
+      fi
+    fi
   fi
 
   discovered=$(wc -l <"$STATUS_DIR/hunt_queue.raw" | tr -d ' ')
@@ -368,6 +608,12 @@ Output ONLY a newline-separated list of file paths, most promising first. No com
     fi
   else
     echo "    Smart discovery returned no valid files; falling back to standard queue"
+    if [[ -n "${discovery_last:-}" && -f "$discovery_last" ]]; then
+      echo "    Last discovery output saved to $discovery_last"
+    fi
+    if [[ -n "${discovery_stderr:-}" && -s "$discovery_stderr" ]]; then
+      echo "    Discovery stderr saved to $discovery_stderr"
+    fi
     build_standard_hunt_queue
   fi
   echo ""
@@ -403,7 +649,7 @@ EOF
 )
     run_codex_exec "$prompt" -o "$codex_last" >/dev/null 2>&1 || true
   else
-    claude -p "You are a security researcher consolidating vulnerability reports.
+    run_claude_exec_with_turn_limit "You are a security researcher consolidating vulnerability reports.
 
 Below are all the verified vulnerability reports from this audit. Many were found via different starting files but describe the same underlying vulnerability.
 
@@ -423,8 +669,7 @@ $(for f in "$OUTDIR"/*.verified.md; do
     echo ""
   done)
 " \
-      --model "$MODEL" --effort max --max-turns 10 \
-      --dangerously-skip-permissions \
+      10 \
       >/dev/null 2>&1
   fi
 
@@ -438,6 +683,7 @@ $(for f in "$OUTDIR"/*.verified.md; do
 }
 
 require_cli_tools
+preflight_claude_cli
 
 # ── Display ──────────────────────────────────────────────────────────
 
@@ -657,9 +903,24 @@ The PoC must be concrete and verifiable — a reviewer should be able to clone t
 run_final_provider_review() {
   local canonical_list="$1"
   local report_dir_abs report_parent report_tmp provider_label provider_last prompt
+  local exploitability_marker final_review_marker current_final_inputs saved_final_inputs
 
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
+  exploitability_marker="$report_dir_abs/.exploitability-review-complete"
+  final_review_marker="$report_dir_abs/.final-review-inputs.cksum"
+  current_final_inputs=$(compute_final_review_inputs_fingerprint "$canonical_list")
+
+  echo "=== Phase 5: Final review ==="
+  if [[ -f "$report_dir_abs/README.md" && -f "$final_review_marker" ]]; then
+    saved_final_inputs=$(cat "$final_review_marker")
+    if [[ "$saved_final_inputs" == "$current_final_inputs" ]]; then
+      echo "    Reusing existing maintainer bundle at $report_dir_abs"
+      echo ""
+      return 0
+    fi
+  fi
+
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.report.tmp.XXXXXX")
   provider_label="Codex"
@@ -711,11 +972,10 @@ Requirements:
 EOF
 )
 
-  echo "=== Phase 5: Final review ==="
   if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
-    echo "    Reviewing canonical findings and PoCs with Claude ($MODEL)..."
+    echo "    Reviewing canonical findings and PoCs with Claude ($(describe_claude_model_params))..."
   else
-    echo "    Reviewing canonical findings and PoCs with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+    echo "    Reviewing canonical findings and PoCs with Codex ($(describe_codex_model_params))..."
   fi
 
   if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
@@ -739,6 +999,9 @@ EOF
       rm -rf "$report_dir_abs"
     fi
     mv "$report_tmp" "$report_dir_abs"
+    printf "%s\n" "$current_final_inputs" >"$final_review_marker"
+    rm -f "$exploitability_marker"
+    rm -f "$report_dir_abs/.exploitability-review-inputs.cksum"
     echo "    Final maintainer bundle written to $report_dir_abs"
   else
     rm -rf "$report_tmp"
@@ -751,14 +1014,28 @@ EOF
 
 run_final_exploitability_review() {
   local report_dir_abs report_parent report_tmp provider_label provider_last prompt
+  local exploitability_marker exploitability_inputs_marker current_report_inputs saved_report_inputs
 
   report_dir_abs=$(abspath "$REPORT_DIR")
   report_parent=$(dirname "$report_dir_abs")
+  exploitability_marker="$report_dir_abs/.exploitability-review-complete"
+  exploitability_inputs_marker="$report_dir_abs/.exploitability-review-inputs.cksum"
 
   [[ -d "$report_dir_abs" ]] || {
     echo "    Final maintainer bundle not found at $report_dir_abs" >&2
     return 1
   }
+
+  echo "=== Phase 6: Exploitability review ==="
+  current_report_inputs=$(compute_report_dir_fingerprint "$report_dir_abs")
+  if [[ -f "$exploitability_marker" && -f "$exploitability_inputs_marker" ]]; then
+    saved_report_inputs=$(cat "$exploitability_inputs_marker")
+    if [[ "$saved_report_inputs" == "$current_report_inputs" ]]; then
+      echo "    Exploitability review already completed at $report_dir_abs"
+      echo ""
+      return 0
+    fi
+  fi
 
   mkdir -p "$report_parent"
   report_tmp=$(mktemp -d "$report_parent/.exploitability.tmp.XXXXXX")
@@ -821,11 +1098,10 @@ Requirements:
 - Ensure the bundle remains self-contained and README.md still exists when you finish.
 EOF
 
-  echo "=== Phase 6: Exploitability review ==="
   if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
-    echo "    Pressure-testing severity and exploitability stories with Claude ($MODEL)..."
+    echo "    Pressure-testing severity and exploitability stories with Claude ($(describe_claude_model_params))..."
   else
-    echo "    Pressure-testing severity and exploitability stories with Codex ($CODEX_MODEL, $CODEX_REASONING_EFFORT, $CODEX_SERVICE_TIER)..."
+    echo "    Pressure-testing severity and exploitability stories with Codex ($(describe_codex_model_params))..."
   fi
 
   if [[ "$CLAUDE_ONLY" -eq 1 ]]; then
@@ -847,6 +1123,9 @@ EOF
   if [[ -f "$report_tmp/README.md" ]]; then
     rm -rf "$report_dir_abs"
     mv "$report_tmp" "$report_dir_abs"
+    current_report_inputs=$(compute_report_dir_fingerprint "$report_dir_abs")
+    touch "$exploitability_marker"
+    printf "%s\n" "$current_report_inputs" >"$exploitability_inputs_marker"
     echo "    Final maintainer bundle updated with exploitability review at $report_dir_abs"
   else
     rm -rf "$report_tmp"
@@ -860,8 +1139,8 @@ EOF
 # ── Main ─────────────────────────────────────────────────────────────
 
 # Phase 0: Smart discovery
-find_sources >"$STATUS_DIR/all_sources"
-src_count=$(wc -l <"$STATUS_DIR/all_sources" | tr -d ' ')
+find_sources >"$OUTDIR_ABS/all_sources.txt"
+src_count=$(wc -l <"$OUTDIR_ABS/all_sources.txt" | tr -d ' ')
 run_smart_discovery "$src_count"
 
 # Phase 1: Hunt
