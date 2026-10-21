@@ -5,10 +5,10 @@ It is named for Chris Rohlf (`@struct`) and reconstructs the method described in
 [Using Claude to reduce the attack surface of code](https://www.anthropic.com/research/attack-surface-reduction).
 It is not Anthropic's unpublished skill or an exact reproduction of its tooling.
 
-The orchestrator requires Python 3.10+, Git, and an installed, authenticated Claude
-CLI on a Unix host; it has no third-party Python dependencies. Each pass gets a
-fresh Claude session and a short handoff from the preceding pass. The model is
-the CLI default unless `--model` is supplied.
+The orchestrator requires Python 3.10+, Git, and an authenticated agent CLI on a
+Unix host; it has no third-party Python dependencies. It runs Codex with Astra
+(`gpt-6-astra`) by default. Each pass gets a fresh agent session and a short handoff
+from the preceding pass. `--model` overrides the model.
 
 ## Run an audit
 
@@ -17,6 +17,10 @@ Start with a dry run to inspect the generated prompts and manifest:
 ```sh
 ./struct /path/to/project --dry-run
 ```
+
+To use an installed Claude CLI instead, pass `--runner claude`; its default model
+comes from the CLI unless `--model` is supplied. For compatibility, `--claude-bin`
+also selects Claude when `--runner` is omitted.
 
 Run against a committed revision, supplying the project's own verification commands:
 
@@ -43,11 +47,12 @@ is not part of that revision.
 ./struct --resume /path/to/project-struct-20261021T120000Z-abc123
 ```
 
-Resume uses the saved settings and also starts an audit prepared with `--dry-run`.
+Resume uses the saved runner and settings, including for a prepared dry run.
+Older runs without a recorded runner continue with Claude.
 Completed results and artifact fingerprints are checked before reuse; altered
 evidence requires a new run. Incomplete attempts are archived under `attempts/`
 before retry. A dry run pins the commit and creates prompts and manifests without
-cloning source, invoking Claude, or executing target commands.
+cloning source, invoking a model, or executing target commands.
 
 ## Three passes
 
@@ -109,18 +114,25 @@ adopting a change; the tool does not merge or deploy them.
 | `--build-command CMD` | Shell command for building each verification copy. |
 | `--test-command CMD` | Project regression command. |
 | `--black-box-command CMD` | Black-box compatibility regression command. |
-| `--model NAME` | Override the Claude CLI's default model. |
-| `--claude-bin PATH` | Claude executable; defaults to `claude`. |
+| `--runner codex\|claude` | Agent CLI; defaults to `codex`. |
+| `--model NAME` | Model override; Codex defaults to `gpt-6-astra`, Claude to its CLI default. |
+| `--codex-bin PATH` | Codex executable; defaults to `codex`. |
+| `--claude-bin PATH` | Claude executable; defaults to `claude`; implies Claude if no runner is set. |
 | `--timeout SECONDS` | Timeout per audit/replay command; defaults to `1800`. |
-| `--max-turns N` | Claude turn limit per pass; defaults to `100`. |
+| `--max-turns N` | Claude-only turn limit per pass; defaults to `100`; rejected for Codex. |
 | `--dry-run` | Prepare an inspectable run without executing the audit. |
 | `--resume RUN_DIR` | Continue an existing run with its saved settings. |
 
-Claude runs noninteractively with `--safe-mode`, automatic permissions, and session
-persistence disabled; no permission bypass flag is used. The installed CLI must
-support these options. Source copies isolate repository changes, **not process
-access**: Claude, build scripts, and replay commands execute on the host. Run an
-untrusted target inside a disposable VM with only the access the audit requires.
+Codex runs noninteractively in an ephemeral session with a `workspace-write`
+sandbox, the artifact directory additionally writable, and approval prompts
+disabled. Its configured environment and rules otherwise apply. There is no
+native Codex turn limit here; `--timeout` bounds each pass. Claude uses safe mode,
+automatic permissions, and no session persistence. Neither runner uses a
+permission bypass flag.
+
+The orchestrator's build and replay commands execute directly on the host, outside
+the agent's sandbox. Source copies do not isolate those processes. Run an untrusted
+target inside a disposable VM with only the access the audit requires.
 
 ## Artifacts
 
@@ -135,6 +147,6 @@ revision and configuration context so another reviewer can reproduce the claims.
 python3 -m unittest discover -s tests -p 'test_struct.py' -v
 ```
 
-These integration tests use temporary Git repositories and an instrumented target
-with a fake Claude CLI. They exercise real patch application and subprocess replay
-without making model calls or scanning an external project.
+These integration tests use temporary Git repositories, an instrumented target,
+and fake Codex and Claude CLIs. They exercise real patch application and subprocess
+replay without making model calls or scanning an external project.

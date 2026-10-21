@@ -48,7 +48,7 @@ print("allowed request: ok")
 
 # This fake follows the real CLI's structured-output interface. It generates a
 # genuine git patch and probes a subprocess in the runner's independent trees.
-FAKE_CLAUDE = r'''
+FAKE_AGENT = r'''
 import json
 import os
 from pathlib import Path
@@ -56,6 +56,7 @@ import subprocess
 import sys
 
 configuration = json.loads(Path(os.environ["STRUCT_TEST_CONFIG"]).read_text())
+is_codex = len(sys.argv) > 1 and sys.argv[1] == "exec"
 name = os.environ["STRUCT_PASS"]
 source = Path(os.environ["STRUCT_SOURCE"])
 artifacts = Path(os.environ["STRUCT_ARTIFACTS"])
@@ -64,6 +65,7 @@ previous = [json.loads(line) for line in log.read_text().splitlines()] if log.ex
 attempt = 1 + sum(item["pass"] == name for item in previous)
 record = {
     "pass": name,
+    "runner": "codex" if is_codex else "claude",
     "pid": os.getpid(),
     "attempt": attempt,
     "argv": sys.argv[1:],
@@ -165,6 +167,25 @@ result = {
     "handoff": "handoff from " + name,
     "findings": findings,
 }
+if is_codex:
+    output = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+    mode = configuration.get("codex_protocol", "success")
+    if mode != "missing-final":
+        output.write_text("{broken" if mode == "malformed-final" else json.dumps({} if mode == "invalid-final" else result))
+    print(json.dumps({"type": "thread.started", "thread_id": "fake-" + name}))
+    if mode == "malformed-events":
+        print("this line is not JSON")
+    if mode == "non-object-event":
+        print("[]")
+    if mode == "untyped-event":
+        print(json.dumps({"message": "missing event type"}))
+    if mode == "error":
+        print(json.dumps({"type": "error", "message": "simulated stream error"}))
+    if mode == "turn-failed":
+        print(json.dumps({"type": "turn.failed", "error": {"message": "simulated failed turn"}}))
+    elif mode != "missing-completion":
+        print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}))
+    raise SystemExit(0)
 envelope = {"type": "result", "subtype": "success", "is_error": False, "structured_output": result}
 if configuration.get("invalid_envelope") == name:
     envelope["subtype"] = "error_max_turns"
@@ -193,8 +214,12 @@ class StructBlackBoxTests(unittest.TestCase):
         self.git("commit", "--quiet", "-m", "instrumented baseline")
         self.commit = self.git("rev-parse", "HEAD").stdout.strip()
         self.fake = self.root / "fake-claude"
-        self.fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(FAKE_CLAUDE))
+        self.fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(FAKE_AGENT))
         self.fake.chmod(0o755)
+        (self.root / "claude").symlink_to(self.fake)
+        self.fake_codex = self.root / "codex"
+        self.fake_codex.write_text(self.fake.read_text())
+        self.fake_codex.chmod(0o755)
         self.configuration = self.root / "fake-config.json"
         self.log = self.root / "calls.jsonl"
         self.configuration.write_text("{}")
@@ -203,6 +228,7 @@ class StructBlackBoxTests(unittest.TestCase):
             "STRUCT_TEST_CONFIG": str(self.configuration),
             "STRUCT_TEST_LOG": str(self.log),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
         }
         self.python = shlex.quote(sys.executable)
         self.out = self.root / "audit"
@@ -218,9 +244,11 @@ class StructBlackBoxTests(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=60,
         )
 
-    def start(self, config=None, *, test_command=None, black_box_command=None, missing=None, extra=()):
+    def start(self, config=None, *, test_command=None, black_box_command=None, missing=None, extra=(), codex=False):
         self.configuration.write_text(json.dumps(config or {}))
-        args = [self.repo, "--out", self.out, "--claude-bin", self.fake, "--timeout", "10"]
+        args = [self.repo, "--out", self.out, "--timeout", "10"]
+        if not codex:
+            args += ["--claude-bin", self.fake]
         args += ["--build-command", f"{self.python} -m py_compile service.py"]
         if missing != "tests":
             args += ["--test-command", test_command or f"{self.python} project_tests.py"]
@@ -243,6 +271,97 @@ class StructBlackBoxTests(unittest.TestCase):
 
     def finding_config(self, **finding):
         return {"findings": {PASSES[0]: [finding]}}
+
+    def test_codex_defaults_to_astra_and_replays_the_finding(self):
+        self.assert_success(self.start(self.finding_config(), codex=True))
+        self.assertEqual(self.manifest()["runner"], "codex")
+        self.assertEqual(self.manifest()["model"], "gpt-6-astra")
+        self.assertEqual(self.outcome()["status"], "verified")
+        calls = self.calls()
+        self.assertEqual([call["pass"] for call in calls], list(PASSES))
+        for index, call in enumerate(calls):
+            argv = call["argv"]
+            self.assertEqual(call["runner"], "codex")
+            self.assertEqual(argv[0], "exec")
+            self.assertIn("--ephemeral", argv)
+            self.assertIn("--json", argv)
+            self.assertEqual(argv[argv.index("--model") + 1], "gpt-6-astra")
+            self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
+            self.assertIn('approval_policy="never"', argv)
+            self.assertNotIn("--max-turns", argv)
+            directory = self.out / "passes" / call["pass"]
+            self.assertEqual(Path(argv[argv.index("--add-dir") + 1]).resolve(), (directory / "artifacts").resolve())
+            schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
+            self.assertIn("findings", schema["required"])
+            self.assertEqual(Path(argv[argv.index("--output-last-message") + 1]).resolve(), (directory / "codex.result.json").resolve())
+            self.assertTrue((directory / "codex.stdout.log").is_file())
+            self.assertFalse((directory / "claude.stdout.log").exists())
+            self.assertFalse(call["prior_agent_marker"])
+            if index:
+                self.assertIn("handoff from " + PASSES[index - 1], call["prompt"])
+
+    def test_codex_model_override_and_custom_binary(self):
+        self.assert_success(self.start(codex=True, extra=("--model", "custom-codex-model", "--codex-bin", self.fake_codex)))
+        self.assertEqual(self.manifest()["model"], "custom-codex-model")
+        for call in self.calls():
+            self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "custom-codex-model")
+
+    def test_explicit_claude_uses_cli_default_model_and_turn_limit(self):
+        self.assert_success(self.invoke(self.repo, "--out", self.out, "--runner", "claude", "--max-turns", "4"))
+        self.assertEqual(self.manifest()["runner"], "claude")
+        for call in self.calls():
+            self.assertEqual(call["runner"], "claude")
+            self.assertNotIn("--model", call["argv"])
+            self.assertEqual(call["argv"][call["argv"].index("--max-turns") + 1], "4")
+
+    def test_conflicting_runners_and_codex_turn_limit_are_rejected(self):
+        cases = (
+            ("--runner", "codex", "--claude-bin", self.fake),
+            ("--runner", "claude", "--codex-bin", self.fake_codex),
+            ("--claude-bin", self.fake, "--codex-bin", self.fake_codex),
+            ("--max-turns", "4"),
+        )
+        for index, args in enumerate(cases):
+            with self.subTest(args=args):
+                result = self.invoke(self.repo, "--out", self.root / ("conflict-" + str(index)), *args)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.calls())
+
+    def test_codex_incomplete_failed_or_malformed_output_cannot_complete_pass(self):
+        modes = ("error", "turn-failed", "missing-completion", "malformed-events",
+                 "non-object-event", "untyped-event", "malformed-final", "invalid-final", "missing-final")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                self.out = self.root / ("codex-" + mode)
+                result = self.start({"codex_protocol": mode}, codex=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.manifest()["status"], "failed")
+                self.assertEqual(self.manifest()["passes"][PASSES[0]]["status"], "failed")
+                self.assertFalse((self.out / "passes" / PASSES[0] / "result.json").exists())
+                self.assertFalse((self.out / "verification").exists())
+
+    def test_codex_resume_keeps_frozen_runner_and_default_model(self):
+        self.assertNotEqual(self.start({"fail_once": PASSES[1]}, codex=True).returncode, 0)
+        self.assertEqual(self.manifest()["runner"], "codex")
+        self.assertEqual(self.manifest()["model"], "gpt-6-astra")
+        rejected = self.invoke("--resume", self.out, "--model", "different-model")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assert_success(self.invoke("--resume", self.out))
+        self.assertEqual([call["pass"] for call in self.calls()], [PASSES[0], PASSES[1], PASSES[1], PASSES[2]])
+        for call in self.calls():
+            self.assertEqual(call["runner"], "codex")
+            self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "gpt-6-astra")
+
+    def test_old_manifest_without_runner_resumes_with_claude(self):
+        self.assert_success(self.start(extra=("--dry-run",)))
+        manifest = self.manifest()
+        del manifest["runner"]
+        (self.out / "manifest.json").write_text(json.dumps(manifest))
+        self.assert_success(self.invoke("--resume", self.out))
+        self.assertEqual(len(self.calls()), 3)
+        for call in self.calls():
+            self.assertEqual(call["runner"], "claude")
+            self.assertNotIn("--model", call["argv"])
 
     def test_nominal_replay_fresh_sessions_short_handoff_and_unchanged_original(self):
         (self.repo / "service.py").write_text(SERVICE + "\nUNCOMMITTED = True\n")

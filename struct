@@ -4,7 +4,8 @@
 https://www.anthropic.com/research/attack-surface-reduction
 
 This reconstructs the published three-pass method, not Anthropic's unpublished
-skill. Requires Python 3.10+, Git, and Claude Code. See STRUCT.md for usage.
+skill. Requires Python 3.10+, Git, and Codex (Astra by default) or Claude Code.
+See STRUCT.md for usage.
 The filename deliberately has no .py suffix: struct.py shadows Python's stdlib.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ import time
 import uuid
 
 ARTICLE = "https://www.anthropic.com/research/attack-surface-reduction"
+DEFAULT_MODEL = "gpt-6-astra"
 VERSION = 1
 PASSES = {
     "01-default-exposure": """Find implementations reachable in shipped defaults
@@ -443,6 +445,60 @@ def lock_run(root, manifest):
             raise
 
 
+def audit_pass(name, manifest, directory, prompt):
+    runner = manifest["runner"]
+    executable = manifest[f"{runner}_bin"]
+    cli = shutil.which(executable)
+    if not cli:
+        raise AuditError(f"{runner} CLI not found: {executable}")
+    artifacts = directory / "artifacts"
+    log = directory / f"{runner}.stdout.log"
+    if runner == "codex":
+        schema = directory / "schema.json"
+        output = directory / "codex.result.json"
+        write_json(schema, SCHEMA)
+        output.unlink(missing_ok=True)
+        command = [cli, "exec", "--ephemeral", "--sandbox", "workspace-write",
+                   "-c", 'approval_policy="never"', "--add-dir", str(artifacts),
+                   "--json", "--color", "never", "--output-schema", str(schema),
+                   "--output-last-message", str(output), "--model", manifest["model"], "-"]
+    else:
+        command = [cli, "-p", "--safe-mode", "--no-session-persistence", "--output-format", "json",
+                   "--json-schema", json.dumps(SCHEMA), "--permission-mode", "auto",
+                   "--permission-prompts", "none", "--max-turns", str(manifest["max_turns"])]
+        if manifest["model"]:
+            command.extend(["--model", manifest["model"]])
+    env = {**os.environ, "STRUCT_PASS": name, "STRUCT_ARTIFACTS": str(artifacts),
+           "STRUCT_SOURCE": str(directory / "source")}
+    process = execute(command, directory / "source", log, manifest["timeout"], stdin=prompt, env=env)
+    if process["exit_code"] != 0:
+        raise AuditError(f"{name}: {runner} failed ({process.get('error', process['exit_code'])}); inspect logs.")
+    if runner == "codex":
+        completed = False
+        with log.open(encoding="utf-8") as events:
+            for line in events:
+                event = json.loads(line)
+                if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                    raise AuditError(f"{name}: Invalid Codex event; inspect logs.")
+                if event["type"] in ("error", "turn.failed"):
+                    raise AuditError(f"{name}: Codex reported an error; inspect logs.")
+                if event["type"] == "turn.started":
+                    completed = False
+                elif event["type"] == "turn.completed":
+                    completed = True
+        if not completed:
+            raise AuditError(f"{name}: Codex did not complete its turn; inspect logs.")
+        result = read_json(output)
+    else:
+        response = read_json(log)
+        if (not isinstance(response, dict) or response.get("type") != "result"
+                or response.get("subtype") != "success" or response.get("is_error") is not False
+                or response.get("permission_denials")):
+            raise AuditError(f"{name}: Claude reported an error or denied tools; inspect logs.")
+        result = response.get("structured_output")
+    return validate_result(result, artifacts)
+
+
 def run(root, manifest, dry_run):
     with lock_run(root, manifest):
         handoff = ""
@@ -484,27 +540,8 @@ def run(root, manifest, dry_run):
             if git(root / "snapshot", "rev-parse", "HEAD") != manifest["commit"] or git(root / "snapshot", "status", "--porcelain"):
                 raise AuditError("Pinned snapshot changed; start a new run.")
             clone(root / "snapshot", directory / "source", manifest["commit"])
-            cli = shutil.which(manifest["claude_bin"])
-            if not cli:
-                raise AuditError(f"Claude CLI not found: {manifest['claude_bin']}")
-            command = [cli, "-p", "--safe-mode", "--no-session-persistence", "--output-format", "json",
-                       "--json-schema", json.dumps(SCHEMA), "--permission-mode", "auto",
-                       "--permission-prompts", "none", "--max-turns", str(manifest["max_turns"])]
-            if manifest["model"]:
-                command.extend(["--model", manifest["model"]])
             print(f"{name}: auditing {manifest['commit'][:12]} (logs: {directory})", flush=True)
-            env = {**os.environ, "STRUCT_PASS": name, "STRUCT_ARTIFACTS": str(artifacts),
-                   "STRUCT_SOURCE": str(directory / "source")}
-            process = execute(command, directory / "source", directory / "claude.stdout.log",
-                              manifest["timeout"], stdin=prompt, env=env)
-            if process["exit_code"] != 0:
-                raise AuditError(f"{name}: Claude failed ({process.get('error', process['exit_code'])}); inspect logs.")
-            response = read_json(directory / "claude.stdout.log")
-            if (not isinstance(response, dict) or response.get("type") != "result"
-                    or response.get("subtype") != "success" or response.get("is_error") is not False
-                    or response.get("permission_denials")):
-                raise AuditError(f"{name}: Claude reported an error or denied tools; inspect logs.")
-            result = validate_result(response.get("structured_output"), artifacts)
+            result = audit_pass(name, manifest, directory, prompt)
             write_json(directory / "result.json", result)
             before = fingerprints(artifacts)
             outcomes = {}
@@ -548,7 +585,9 @@ def main():
     parser.add_argument("--build-command", help="build command, run by /bin/sh in each source copy")
     parser.add_argument("--test-command", help="project regression test command")
     parser.add_argument("--black-box-command", help="black-box command; successful stdout must match exactly")
-    parser.add_argument("--model", help="Claude model; omitted to inherit the CLI default")
+    parser.add_argument("--runner", choices=("codex", "claude"), help="agent CLI (default: codex)")
+    parser.add_argument("--model", help=f"model (default: {DEFAULT_MODEL} for Codex; CLI default for Claude)")
+    parser.add_argument("--codex-bin", help="Codex executable (default: codex)")
     parser.add_argument("--claude-bin", help="Claude executable (default: claude)")
     parser.add_argument("--timeout", type=positive_integer, help="seconds per subprocess (default: 1800)")
     parser.add_argument("--max-turns", type=positive_integer, help="Claude turns per pass (default: 100)")
@@ -565,9 +604,19 @@ def main():
             manifest = read_json(root / "manifest.json")
             if manifest.get("version") != VERSION or manifest.get("root") != str(root):
                 raise AuditError("Unsupported or relocated run manifest")
+            # Runs created before Codex support must retain their original runner.
+            manifest.setdefault("runner", "claude")
         else:
             if not args.repo:
                 parser.error("repo is required unless --resume is supplied")
+            runner = args.runner or ("claude" if args.claude_bin else "codex")
+            if (runner == "codex" and args.claude_bin) or (runner == "claude" and args.codex_bin):
+                raise AuditError("Executable option conflicts with the selected runner")
+            if runner == "codex" and args.max_turns is not None:
+                raise AuditError("--max-turns is Claude-only; use --timeout for Codex")
+            executable = args.codex_bin if runner == "codex" else args.claude_bin
+            if executable and "/" in executable:
+                executable = str(Path(executable).expanduser().resolve())
             repo = Path(git(Path(args.repo).expanduser().resolve(), "rev-parse", "--show-toplevel")).resolve()
             commit = git(repo, "rev-parse", "--verify", "--end-of-options", (args.ref or "HEAD") + "^{commit}")
             root = (args.out or repo.parent / f"{repo.name}-struct-{timestamp()}-{uuid.uuid4().hex[:6]}").expanduser().resolve()
@@ -578,8 +627,9 @@ def main():
             manifest = {"version": VERSION, "root": str(root), "repo": str(repo), "commit": commit,
                         "article": ARTICLE, "created": timestamp(), "status": "planned", "passes": {},
                         "context": context, "build_command": args.build_command, "test_command": args.test_command,
-                        "black_box_command": args.black_box_command, "model": args.model,
-                        "claude_bin": str(Path(args.claude_bin).expanduser().resolve()) if args.claude_bin and "/" in args.claude_bin else args.claude_bin or "claude",
+                        "black_box_command": args.black_box_command, "runner": runner,
+                        "model": args.model or (DEFAULT_MODEL if runner == "codex" else None),
+                        f"{runner}_bin": executable or runner,
                         "timeout": args.timeout or 1800, "max_turns": args.max_turns or 100}
             write_json(root / "manifest.json", manifest)
         print(f"Run: {root}\nCommitted revision only: {manifest['commit']}", flush=True)
