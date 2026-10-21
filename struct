@@ -263,12 +263,18 @@ with cwd and STRUCT_SOURCE set to a fresh source copy; STRUCT_ARTIFACTS points t
 this artifacts directory. In argv strings, {{source}} and {{artifacts}} expand to
 those paths. Do not hardcode this pass's source path. Keep fixtures and probes
 outside the source tree; each check receives the same files on both revisions.
+Artifacts are immutable during replay: probes must not create, change, or delete
+files there, including logs and compiler caches. Put runtime scratch files under
+the source copy or a temporary directory, and emit observations to stdout.
 The negative probe exits 1 ONLY when the unwanted operation demonstrably runs,
 0 ONLY when an earlier gate blocks it, and 2 on setup/unexpected failures. Its
 last stdout line must be JSON with reached (boolean), trace (nonempty text of
 the observed instrumentation), and result (the observable outcome).
 The positive probe exercises a supported allowed case, exits 0, and emits the
 same JSON shape with reached=true. Its result must match on both revisions.
+A malformed-request rejection is not a positive control for successful feature
+use. If a valid allowed case cannot run, leave positive_argv empty and explain
+the missing coverage; do not substitute an error-path check to earn verification.
 Probes may instrument the target for observation but must not implement the fix,
 substitute a mock of the sensitive operation, or decide success by tree name.
 Missing evidence uses empty argv/evidence arrays; preserve the hypothesis.
