@@ -28,6 +28,7 @@ import uuid
 
 ARTICLE = "https://www.anthropic.com/research/attack-surface-reduction"
 DEFAULT_MODEL = "gpt-6-astra"
+FINDING_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
 VERSION = 1
 PASSES = {
     "01-default-exposure": """Find implementations reachable in shipped defaults
@@ -63,6 +64,7 @@ FINDING_SCHEMA = {
 }
 FINDING_SCHEMA["properties"]["behavior_change"] = {
     "type": "string", "enum": ["none", "nondefault", "unknown"]}
+FINDING_SCHEMA["properties"]["id"] = {"type": "string", "pattern": f"^{FINDING_ID_PATTERN}$"}
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -203,9 +205,10 @@ def validate_result(data, artifacts):
         if not finding["source_locations"]:
             raise AuditError("A finding needs source locations")
         identifier = finding["id"]
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", identifier) or identifier in identifiers:
+        if not re.fullmatch(FINDING_ID_PATTERN, identifier) or identifier.casefold() in identifiers:
             raise AuditError(f"Invalid or duplicate finding ID: {identifier!r}")
-        identifiers.add(identifier)
+        # Replay directories must remain distinct on case-insensitive filesystems.
+        identifiers.add(identifier.casefold())
         if finding["behavior_change"] not in ("none", "nondefault", "unknown"):
             raise AuditError("behavior_change must be none, nondefault, or unknown")
         for name in finding["evidence"] + ([finding["patch"]] if finding["patch"] else []):
@@ -294,7 +297,9 @@ source-grounded descriptions. coverage describes what was actually examined;
 unexamined lists gaps. handoff is at most 4000 characters of factual navigation,
 commands, and open questions; do not paste the conversation or earlier reports.
 Every finding needs rationale for unnecessary exposure, a concrete recommendation,
-source_locations, and limitations. evidence and patch are relative file paths under artifacts; patch
+source_locations, and limitations. Use 1-64 ASCII letters, digits, underscores or
+hyphens for each finding id, starting with a letter or digit; ids must be unique
+ignoring case. evidence and patch are relative file paths under artifacts; patch
 is an empty string when no patch is defensible. No model-written status implies
 verification: the runner records its own replay results. Return zero findings
 when warranted, never manufacture one to fill the schema.

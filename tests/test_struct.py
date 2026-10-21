@@ -87,8 +87,9 @@ if configuration.get("timeout_once") == name and attempt == 1:
 findings = []
 for spec in configuration.get("findings", {}).get(name, []):
     identifier = spec.get("id", "exposure")
+    artifact_identifier = spec.get("artifact_id", identifier)
     mode = spec.get("mode", "nominal")
-    folder = artifacts / identifier
+    folder = artifacts / artifact_identifier
     folder.mkdir()
     probe_text = ''' + repr('''import json
 import os
@@ -131,7 +132,7 @@ raise SystemExit(observed.returncode)
     difference = subprocess.run(["git", "-C", str(source), "diff", "--", "service.py"], capture_output=True, text=True, check=True)
     (folder / "gate.patch").write_text(difference.stdout)
     (source / "service.py").write_text(original)
-    evidence = [identifier + "/trace.json", identifier + "/probe.py"]
+    evidence = [artifact_identifier + "/trace.json", artifact_identifier + "/probe.py"]
     if mode in ("escape-parent", "escape-symlink"):
         outside = artifacts.parent / "outside-evidence.txt"
         outside.write_text("not in the artifact directory")
@@ -139,7 +140,7 @@ raise SystemExit(observed.returncode)
             evidence = ["../outside-evidence.txt"]
         else:
             (folder / "outside-link").symlink_to(outside)
-            evidence = [identifier + "/outside-link"]
+            evidence = [artifact_identifier + "/outside-link"]
     findings.append({
         "id": identifier,
         "title": "Unnecessary operation before the gate",
@@ -149,12 +150,12 @@ raise SystemExit(observed.returncode)
         "configuration": "fixture shipped defaults",
         "rationale": "PRIVATE_DISCOVERY_DETAIL: denied requests do not need the operation",
         "recommendation": "Enable the request gate before entering sensitive()",
-        "patch": identifier + "/gate.patch",
+        "patch": artifact_identifier + "/gate.patch",
         "behavior_change": spec.get("behavior_change", "none"),
         "source_locations": ["service.py:7"],
         "evidence": evidence,
-        "negative_argv": [sys.executable, "{artifacts}/" + identifier + "/probe.py", "negative"],
-        "positive_argv": [sys.executable, "{artifacts}/" + identifier + "/probe.py", "positive"],
+        "negative_argv": [sys.executable, "{artifacts}/" + artifact_identifier + "/probe.py", "negative"],
+        "positive_argv": [sys.executable, "{artifacts}/" + artifact_identifier + "/probe.py", "positive"],
         "limitations": ["One instrumented fixture and configuration only"],
     })
 
@@ -305,6 +306,51 @@ class StructBlackBoxTests(unittest.TestCase):
         self.assertEqual(self.manifest()["model"], "custom-codex-model")
         for call in self.calls():
             self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "custom-codex-model")
+
+    def test_uppercase_finding_ids_complete_independent_replay(self):
+        config = {"findings": {PASSES[0]: [{"id": "F01"}, {"id": "H01"}]}}
+        self.assert_success(self.start(config, codex=True))
+        for identifier in ("F01", "H01"):
+            with self.subTest(identifier=identifier):
+                outcome = self.outcome(identifier=identifier)
+                self.assertEqual(outcome["status"], "verified")
+                self.assertIs(outcome["replay_passed"], True)
+                for label, expected in (("baseline-negative", (1, True)),
+                                        ("patched-negative", (0, False)),
+                                        ("baseline-positive", (0, True)),
+                                        ("patched-positive", (0, True))):
+                    check = outcome["checks"][label]
+                    self.assertEqual((check["exit_code"], check["probe"]["reached"]), expected)
+        argv = self.calls()[0]["argv"]
+        schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
+        identifier_schema = schema["properties"]["findings"]["items"]["properties"]["id"]
+        self.assertEqual(identifier_schema["pattern"], r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+        self.assertEqual(self.manifest()["status"], "completed")
+
+    def test_case_only_finding_id_collisions_are_rejected_before_replay(self):
+        config = {"findings": {PASSES[0]: [
+            {"id": "F01", "artifact_id": "first"},
+            {"id": "f01", "artifact_id": "second"},
+        ]}}
+        result = self.start(config, codex=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("duplicate finding ID", result.stderr)
+        self.assertFalse((self.out / "verification").exists())
+        self.assertFalse((self.out / "passes" / PASSES[0] / "result.json").exists())
+        self.assertEqual(self.manifest()["passes"][PASSES[0]]["status"], "failed")
+
+    def test_unsafe_finding_ids_are_rejected_before_replay(self):
+        identifiers = ("..", "../outside", "/absolute", r"F\01", "F.01", "F 01",
+                       "-F01", "_F01", "F" * 65, "Fé01", "F01\n")
+        for index, identifier in enumerate(identifiers):
+            with self.subTest(identifier=identifier):
+                self.out = self.root / ("unsafe-id-" + str(index))
+                result = self.start(self.finding_config(id=identifier, artifact_id="safe"), codex=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Invalid or duplicate finding ID", result.stderr)
+                self.assertFalse((self.out / "verification").exists())
+                self.assertFalse((self.out / "passes" / PASSES[0] / "result.json").exists())
+                self.assertEqual(self.manifest()["passes"][PASSES[0]]["status"], "failed")
 
     def test_explicit_claude_uses_cli_default_model_and_turn_limit(self):
         self.assert_success(self.invoke(self.repo, "--out", self.out, "--runner", "claude", "--max-turns", "4"))
