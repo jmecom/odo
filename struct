@@ -226,8 +226,6 @@ def fingerprints(directory):
 
 def prompt_for(name, manifest, directory, handoff):
     return f"""You are performing an authorized repository attack-surface audit.
-Method: Chris Rohlf (@struct), {ARTICLE}
-This is an independent reconstruction, not his original unpublished skill.
 
 PASS: {name}
 {PASSES[name]}
@@ -395,7 +393,7 @@ def verify_finding(root, name, finding, artifacts, manifest):
 
 
 def summarize(root, manifest):
-    lines = ["# Struct attack-surface audit", "", f"Inspired by Chris Rohlf (@struct): {ARTICLE}", "",
+    lines = ["# Struct attack-surface audit", "",
              f"Commit: `{manifest['commit']}`", f"Run status: {manifest['status']}", "",
              "Verified means the recorded replay checks passed. It does not establish that the repository is secure.", ""]
     if manifest.get("error"):
