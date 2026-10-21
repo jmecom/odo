@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Attack-surface reduction inspired by Chris Rohlf (@struct).
+
+https://www.anthropic.com/research/attack-surface-reduction
+
+This reconstructs the published three-pass method, not Anthropic's unpublished
+skill. Requires Python 3.10+, Git, and Claude Code. See STRUCT.md for usage.
+The filename deliberately has no .py suffix: struct.py shadows Python's stdlib.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+ARTICLE = "https://www.anthropic.com/research/attack-surface-reduction"
+VERSION = 1
+PASSES = {
+    "01-default-exposure": """Find implementations reachable in shipped defaults
+that intended default functionality does not need. Trace feature flags through
+dispatch and parsing. For dynamically confirmed unnecessary exposure, implement
+the smallest gate as an independent patch against the pinned baseline. Preserve
+intended default behavior. Set behavior_change to nondefault or unknown whenever
+supported non-default behavior changes or its preservation is uncertain.""",
+    "02-early-execution": """Find sensitive work before its required security or
+protocol-state gate across supported configurations: parsing, decompression,
+verification, allocation, callbacks, or state changes. Identify the actual value
+that selects the implementation, including embedded types and nested objects.
+Propose earlier checks or state guards. Record any unavoidable minimal parsing
+needed to authenticate; do not assume all parsing can move after authentication.
+These proposals require human review even if a candidate patch passes tests.""",
+    "03-configuration-interactions": """Find accepted configuration combinations
+that silently disable, bypass, or weaken a security control. Trace defaults,
+aliases, namespaces, precedence, endpoint overrides, build flags, and reloads to
+runtime enforcement. Prioritize settings sharing a control; pairwise testing is
+not exhaustive. Reproduce contradictory combinations and propose explicit
+configuration rejection or consistent enforcement. Changes require human review.""",
+}
+TEXT_FIELDS = ("id", "title", "entry_point", "sensitive_operation", "expected_gate",
+               "configuration", "rationale", "recommendation", "patch", "behavior_change")
+LIST_FIELDS = ("source_locations", "evidence", "negative_argv", "positive_argv", "limitations")
+FINDING_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        **{key: {"type": "string"} for key in TEXT_FIELDS},
+        **{key: {"type": "array", "items": {"type": "string"}} for key in LIST_FIELDS},
+    },
+    "required": list(TEXT_FIELDS + LIST_FIELDS),
+}
+FINDING_SCHEMA["properties"]["behavior_change"] = {
+    "type": "string", "enum": ["none", "nondefault", "unknown"]}
+SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "inventory": {"type": "array", "items": {"type": "string"}},
+        "configurations": {"type": "array", "items": {"type": "string"}},
+        "coverage": {"type": "string"},
+        "unexamined": {"type": "array", "items": {"type": "string"}},
+        "handoff": {"type": "string", "maxLength": 4000},
+        "findings": {"type": "array", "items": FINDING_SCHEMA},
+    },
+    "required": ["inventory", "configurations", "coverage", "unexamined", "handoff", "findings"],
+}
+
+
+class AuditError(Exception):
+    pass
+
+
+def timestamp():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def write_json(path, data):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise AuditError(f"Cannot read JSON from {path}: {exc}") from exc
+
+
+def digest(path):
+    with path.open("rb") as handle:
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            checksum.update(chunk)
+        return checksum.hexdigest()
+
+
+def git(repo, *args):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if result.returncode:
+        raise AuditError(result.stderr.strip() or f"git {args[0]} failed")
+    return result.stdout.strip()
+
+
+def stop_process(process):
+    # Children (compilers, servers, and probes) share this newly created group.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    except ProcessLookupError:
+        pass
+
+
+def execute(argv, cwd, log, timeout, *, stdin=None, env=None):
+    log.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    metadata = {"argv": argv, "cwd": str(cwd), "stdout": str(log),
+                "stderr": str(log.with_suffix(".stderr.log"))}
+    with log.open("wb") as output, log.with_suffix(".stderr.log").open("wb") as errors:
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=output, stderr=errors,
+                                   stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            process.communicate(stdin.encode() if stdin is not None else None, timeout=timeout)
+            metadata["exit_code"] = process.returncode
+        except subprocess.TimeoutExpired:
+            stop_process(process)
+            metadata.update(exit_code=None, error=f"Timed out after {timeout}s")
+        except BaseException:
+            stop_process(process)
+            raise
+        finally:
+            # A command must not leave background servers running into the next check.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    metadata["seconds"] = round(time.monotonic() - started, 3)
+    write_json(log.with_suffix(".command.json"), metadata)
+    return metadata
+
+
+def clone(source, destination, commit):
+    result = subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-checkout",
+                             "--", str(source), str(destination)], capture_output=True, text=True)
+    if result.returncode:
+        raise AuditError(f"Could not create snapshot: {result.stderr.strip()}")
+    git(destination, "-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", commit)
+
+
+def artifact_path(artifacts, value):
+    if not value or Path(value).is_absolute():
+        raise AuditError(f"Artifact must be a relative file path: {value!r}")
+    path = (artifacts / value).resolve()
+    if not path.is_relative_to(artifacts.resolve()) or not path.is_file():
+        raise AuditError(f"Missing artifact or path outside artifact directory: {value!r}")
+    if path.stat().st_size == 0:
+        raise AuditError(f"Empty artifact: {value!r}")
+    return path
+
+
+def strings(value):
+    return isinstance(value, list) and all(isinstance(item, str) and "\0" not in item for item in value)
+
+
+def validate_result(data, artifacts):
+    if not isinstance(data, dict):
+        raise AuditError("Expected a structured result object")
+    for key in ("inventory", "configurations", "unexamined"):
+        if not strings(data.get(key)):
+            raise AuditError(f"Invalid result field: {key}")
+    for key in ("coverage", "handoff"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise AuditError(f"Missing result field: {key}")
+    if len(data["handoff"]) > 4000 or not isinstance(data.get("findings"), list):
+        raise AuditError("Invalid handoff or findings")
+    identifiers = set()
+    for finding in data["findings"]:
+        if not isinstance(finding, dict):
+            raise AuditError("Finding must be an object")
+        for key in TEXT_FIELDS:
+            if not isinstance(finding.get(key), str) or "\0" in finding[key]:
+                raise AuditError(f"Invalid finding field: {key}")
+            if key != "patch" and not finding[key].strip():
+                raise AuditError(f"Empty finding field: {key}")
+        for key in LIST_FIELDS:
+            if not strings(finding.get(key)):
+                raise AuditError(f"Invalid finding list: {key}")
+        if not finding["source_locations"]:
+            raise AuditError("A finding needs source locations")
+        identifier = finding["id"]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", identifier) or identifier in identifiers:
+            raise AuditError(f"Invalid or duplicate finding ID: {identifier!r}")
+        identifiers.add(identifier)
+        if finding["behavior_change"] not in ("none", "nondefault", "unknown"):
+            raise AuditError("behavior_change must be none, nondefault, or unknown")
+        for name in finding["evidence"] + ([finding["patch"]] if finding["patch"] else []):
+            artifact_path(artifacts, name)
+        for key in ("negative_argv", "positive_argv"):
+            if finding[key] and not finding[key][0].strip():
+                raise AuditError(f"Empty executable in {key}")
+    return data
+
+
+def fingerprints(directory):
+    result = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise AuditError(f"Artifact symlinks are not supported: {path}")
+        if path.is_file():
+            result[str(path.relative_to(directory))] = digest(path)
+    return result
+
+
+def prompt_for(name, manifest, directory, handoff):
+    return f"""You are performing an authorized repository attack-surface audit.
+Method: Chris Rohlf (@struct), {ARTICLE}
+This is an independent reconstruction, not his original unpublished skill.
+
+PASS: {name}
+{PASSES[name]}
+
+Pinned commit: {manifest['commit']}
+Source copy: {directory / 'source'}
+Write every deliverable under: {directory / 'artifacts'}
+Build command: {manifest['build_command'] or '(not supplied)'}
+Project test command: {manifest['test_command'] or '(not supplied)'}
+Black-box command: {manifest['black_box_command'] or '(not supplied)'}
+Operator's deployment/behavior context:
+{manifest['context'] or '(not supplied; identify assumptions and unresolved requirements)'}
+
+Short factual handoff from the prior pass (claims must be checked):
+{handoff or '(first pass)'}
+
+Reconstruct the entry-point and effective configuration inventories from source
+for THIS pass. Identify which interfaces are public, gated, or rely on external
+deployment controls. Trace untrusted inputs to named sensitive operations and
+their intended gates, including indirect dispatch, nested formats, and alternate
+endpoints. Lack of observed traffic does not establish that a feature is unneeded.
+Record source locations and requirements evidence. Record unexamined paths and
+configuration combinations; do not claim exhaustive coverage or a secure repo.
+
+Confirm each finding with an actual dynamic trace. If unable to build, execute,
+or establish intended behavior, retain a hypothesis with limitations. Never
+invent execution evidence. A final error response is not evidence that sensitive
+work did not execute. Use instrumentation at the operation itself.
+
+For each finding, produce independent, portable evidence scripts in artifacts.
+negative_argv and positive_argv are JSON arrays, not shell strings. They execute
+with cwd and STRUCT_SOURCE set to a fresh source copy; STRUCT_ARTIFACTS points to
+this artifacts directory. In argv strings, {{source}} and {{artifacts}} expand to
+those paths. Do not hardcode this pass's source path. Keep fixtures and probes
+outside the source tree; each check receives the same files on both revisions.
+The negative probe exits 1 ONLY when the unwanted operation demonstrably runs,
+0 ONLY when an earlier gate blocks it, and 2 on setup/unexpected failures. Its
+last stdout line must be JSON with reached (boolean), trace (nonempty text of
+the observed instrumentation), and result (the observable outcome).
+The positive probe exercises a supported allowed case, exits 0, and emits the
+same JSON shape with reached=true. Its result must match on both revisions.
+Probes may instrument the target for observation but must not implement the fix,
+substitute a mock of the sensitive operation, or decide success by tree name.
+Missing evidence uses empty argv/evidence arrays; preserve the hypothesis.
+
+For a defensible default-exposure gate, save a minimal git-apply-compatible patch
+against the pinned commit. All instrumentation and added regression probes stay
+in artifacts, separate from the production patch. Inspect every identified route
+to the operation. Document impact on supported non-default configurations;
+behavior_change=none requires evidence, otherwise use nondefault or unknown.
+Other passes propose changes, optionally with a candidate patch. Do not combine
+findings into dependent patches. You may edit this disposable source copy to
+construct a patch, but the runner independently replays against the pinned base.
+Do not commit, push, contact external systems, or modify the original repository.
+
+Return the requested structured JSON. inventory and configurations are arrays of
+source-grounded descriptions. coverage describes what was actually examined;
+unexamined lists gaps. handoff is at most 4000 characters of factual navigation,
+commands, and open questions; do not paste the conversation or earlier reports.
+Every finding needs rationale for unnecessary exposure, a concrete recommendation,
+source_locations, and limitations. evidence and patch are relative file paths under artifacts; patch
+is an empty string when no patch is defensible. No model-written status implies
+verification: the runner records its own replay results. Return zero findings
+when warranted, never manufacture one to fill the schema.
+"""
+
+
+def probe(argv, source, artifacts, log, timeout):
+    command = [part.replace("{source}", str(source)).replace("{artifacts}", str(artifacts)) for part in argv]
+    env = {**os.environ, "STRUCT_SOURCE": str(source), "STRUCT_ARTIFACTS": str(artifacts),
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    result = execute(command, source, log, timeout, env=env)
+    # Logs remain on disk; only the bounded final line is interpreted as a marker.
+    with log.open("rb") as handle:
+        handle.seek(max(0, log.stat().st_size - 65536))
+        tail = handle.read().decode("utf-8", errors="replace").rstrip().splitlines()
+    try:
+        marker = json.loads(tail[-1]) if tail else None
+    except ValueError:
+        marker = None
+    if (isinstance(marker, dict) and type(marker.get("reached")) is bool
+            and isinstance(marker.get("trace"), str) and marker["trace"].strip()
+            and "result" in marker):
+        result["probe"] = marker
+    return result
+
+
+def check_command(command, source, log, timeout):
+    return execute(["/bin/sh", "-c", command], source, log, timeout)
+
+
+def verify_finding(root, name, finding, artifacts, manifest):
+    directory = root / "verification" / name / finding["id"]
+    directory.mkdir(parents=True)
+    outcome = {"status": "hypothesis", "checks": {}, "limitations": []}
+    checks, limitations = outcome["checks"], outcome["limitations"]
+    timeout = manifest["timeout"]
+
+    def command(label, command_text, tree):
+        checks[label] = check_command(command_text, tree, directory / f"{label}.stdout.log", timeout)
+        return checks[label]["exit_code"] == 0
+
+    def prepare(label, patched=False):
+        tree = directory / label
+        clone(root / "snapshot", tree, manifest["commit"])
+        if patched:
+            patch = artifact_path(artifacts, finding["patch"])
+            git(tree, "apply", "--check", "--", str(patch))
+            git(tree, "apply", "--", str(patch))
+        if manifest["build_command"] and not command(f"{label}-build", manifest["build_command"], tree):
+            raise AuditError(f"{label} build failed.")
+        return tree
+
+    def witness(label, argv, exit_code, reached, patched=False):
+        # Every probe gets the same initial state. A preceding positive case,
+        # test suite, or instrumentation must not influence a negative case.
+        tree = prepare(label + "-source", patched)
+        checks[label] = probe(argv, tree, artifacts, directory / f"{label}.stdout.log", timeout)
+        result = checks[label]
+        return result["exit_code"] == exit_code and result.get("probe", {}).get("reached") is reached
+
+    try:
+        if not finding["negative_argv"]:
+            limitations.append("No executable reachability probe supplied.")
+            return outcome
+        if not witness("baseline-negative", finding["negative_argv"], 1, True):
+            limitations.append("Baseline did not reproduce the specified unwanted execution.")
+            return outcome
+        outcome["status"] = "reproduced"
+        if not finding["patch"]:
+            limitations.append("No candidate patch supplied.")
+            return outcome
+        if not finding["positive_argv"] or not manifest["test_command"] or not manifest["black_box_command"]:
+            limitations.append("Verification requires a positive probe, project tests, and a black-box command.")
+            return outcome
+        for label in ("baseline", "patched"):
+            tree = prepare(label + "-compatibility", patched=label == "patched")
+            for kind, value in (("tests", manifest["test_command"]),
+                                ("black-box", manifest["black_box_command"])):
+                if value and not command(f"{label}-{kind}", value, tree):
+                    limitations.append(f"{label} {kind} did not succeed.")
+                    return outcome
+            if not witness(f"{label}-positive", finding["positive_argv"], 0, True, patched=label == "patched"):
+                limitations.append(f"{label} positive control failed or did not observe the operation.")
+                return outcome
+        if not witness("patched-negative", finding["negative_argv"], 0, False, patched=True):
+            limitations.append("Patched probe did not demonstrate rejection before the operation.")
+            return outcome
+        if digest(directory / "baseline-black-box.stdout.log") != digest(directory / "patched-black-box.stdout.log"):
+            limitations.append("Black-box stdout differed; supply deterministic observable output.")
+            return outcome
+        before_result = json.dumps(checks["baseline-positive"]["probe"]["result"], sort_keys=True)
+        after_result = json.dumps(checks["patched-positive"]["probe"]["result"], sort_keys=True)
+        if before_result != after_result:
+            limitations.append("Positive-control observable results differed.")
+            return outcome
+        outcome["status"] = "verified" if name == "01-default-exposure" and finding["behavior_change"] == "none" else "review-required"
+        outcome["replay_passed"] = True
+        limitations.append("Replay validates these probes and configurations, not every path or the semantic claim.")
+    except (AuditError, OSError) as exc:
+        limitations.append(str(exc))
+    finally:
+        write_json(directory / "result.json", outcome)
+    return outcome
+
+
+def summarize(root, manifest):
+    lines = ["# Struct attack-surface audit", "", f"Inspired by Chris Rohlf (@struct): {ARTICLE}", "",
+             f"Commit: `{manifest['commit']}`", f"Run status: {manifest['status']}", "",
+             "Verified means the recorded replay checks passed. It does not establish that the repository is secure.", ""]
+    if manifest.get("error"):
+        lines.extend([f"Run error: {manifest['error']}", ""])
+    for name, state in manifest["passes"].items():
+        lines.extend([f"## {name}", "", f"State: {state['status']}", ""])
+        if state["status"] != "completed":
+            continue
+        directory = root / "passes" / name
+        data = read_json(directory / "result.json")
+        lines.extend([data["coverage"], ""])
+        for finding in data["findings"]:
+            outcome = state["outcomes"][finding["id"]]
+            lines.extend([f"### {finding['id']}: {finding['title']}", "",
+                          f"Status: **{outcome['status']}**", "", finding["rationale"], "",
+                          f"Recommendation: {finding['recommendation']}", "",
+                          f"Evidence: `passes/{name}/artifacts/`", f"Replay: `verification/{name}/{finding['id']}/result.json`", ""])
+            lines.extend(f"- {item}" for item in finding["limitations"] + outcome["limitations"])
+            lines.append("")
+        if not data["findings"]:
+            lines.extend(["No findings reported within the examined scope.", ""])
+        if data["unexamined"]:
+            lines.extend(["Unexamined:", "", *[f"- {item}" for item in data["unexamined"]], ""])
+    (root / "SUMMARY.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+@contextmanager
+def lock_run(root, manifest):
+    with (root / ".lock").open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AuditError(f"Another struct process owns {root}") from exc
+        try:
+            yield
+        except (AuditError, OSError, ValueError, KeyboardInterrupt) as exc:
+            manifest["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            manifest["error"] = str(exc) or "Interrupted"
+            for state in manifest["passes"].values():
+                if state["status"] == "running":
+                    state["status"] = manifest["status"]
+            write_json(root / "manifest.json", manifest)
+            try:
+                summarize(root, manifest)
+            except (AuditError, KeyError, TypeError):
+                (root / "SUMMARY.md").write_text(f"# Struct audit failed\n\n{manifest['error']}\n", encoding="utf-8")
+            raise
+
+
+def run(root, manifest, dry_run):
+    with lock_run(root, manifest):
+        handoff = ""
+        for name in PASSES:
+            directory = root / "passes" / name
+            state = manifest["passes"].get(name, {})
+            if state.get("status") == "completed":
+                result = validate_result(read_json(directory / "result.json"), directory / "artifacts")
+                if state["result_hash"] != digest(directory / "result.json") or state["artifacts"] != fingerprints(directory / "artifacts"):
+                    raise AuditError(f"Completed evidence changed for {name}; start a new run.")
+                handoff = result["handoff"]
+                print(f"{name}: already completed", flush=True)
+                continue
+            if directory.exists() and not dry_run and state.get("status") not in (None, "planned"):
+                archive = root / "attempts" / f"{name}-{timestamp()}-{uuid.uuid4().hex[:6]}"
+                archive.parent.mkdir(exist_ok=True)
+                directory.rename(archive)
+                verification = root / "verification" / name
+                if verification.exists():
+                    verification.rename(archive / "verification")
+            directory.mkdir(parents=True, exist_ok=True)
+            artifacts = directory / "artifacts"
+            artifacts.mkdir(exist_ok=True)
+            prompt = prompt_for(name, manifest, directory, handoff)
+            (directory / "prompt.md").write_text(prompt, encoding="utf-8")
+            if dry_run:
+                if not state:
+                    manifest["passes"][name] = {"status": "planned"}
+                handoff = "(dry run: actual handoff will be supplied after the preceding pass)"
+                continue
+            manifest["passes"][name] = {"status": "running"}
+            manifest["status"] = "running"
+            manifest.pop("error", None)
+            write_json(root / "manifest.json", manifest)
+            if not (root / "snapshot").exists():
+                temporary = root / ("snapshot-" + uuid.uuid4().hex)
+                clone(manifest["repo"], temporary, manifest["commit"])
+                temporary.rename(root / "snapshot")
+            if git(root / "snapshot", "rev-parse", "HEAD") != manifest["commit"] or git(root / "snapshot", "status", "--porcelain"):
+                raise AuditError("Pinned snapshot changed; start a new run.")
+            clone(root / "snapshot", directory / "source", manifest["commit"])
+            cli = shutil.which(manifest["claude_bin"])
+            if not cli:
+                raise AuditError(f"Claude CLI not found: {manifest['claude_bin']}")
+            command = [cli, "-p", "--safe-mode", "--no-session-persistence", "--output-format", "json",
+                       "--json-schema", json.dumps(SCHEMA), "--permission-mode", "auto",
+                       "--permission-prompts", "none", "--max-turns", str(manifest["max_turns"])]
+            if manifest["model"]:
+                command.extend(["--model", manifest["model"]])
+            print(f"{name}: auditing {manifest['commit'][:12]} (logs: {directory})", flush=True)
+            env = {**os.environ, "STRUCT_PASS": name, "STRUCT_ARTIFACTS": str(artifacts),
+                   "STRUCT_SOURCE": str(directory / "source")}
+            process = execute(command, directory / "source", directory / "claude.stdout.log",
+                              manifest["timeout"], stdin=prompt, env=env)
+            if process["exit_code"] != 0:
+                raise AuditError(f"{name}: Claude failed ({process.get('error', process['exit_code'])}); inspect logs.")
+            response = read_json(directory / "claude.stdout.log")
+            if (not isinstance(response, dict) or response.get("type") != "result"
+                    or response.get("subtype") != "success" or response.get("is_error") is not False
+                    or response.get("permission_denials")):
+                raise AuditError(f"{name}: Claude reported an error or denied tools; inspect logs.")
+            result = validate_result(response.get("structured_output"), artifacts)
+            write_json(directory / "result.json", result)
+            before = fingerprints(artifacts)
+            outcomes = {}
+            for finding in result["findings"]:
+                print(f"  replaying {finding['id']}", flush=True)
+                outcomes[finding["id"]] = verify_finding(root, name, finding, artifacts, manifest)
+                if before != fingerprints(artifacts):
+                    raise AuditError("A replay modified its evidence files; cannot accept these results.")
+            manifest["passes"][name] = {"status": "completed", "result_hash": digest(directory / "result.json"),
+                                         "artifacts": before, "outcomes": outcomes}
+            write_json(root / "manifest.json", manifest)
+            summarize(root, manifest)
+            handoff = result["handoff"]
+        if not dry_run:
+            manifest["status"] = "completed"
+            manifest.pop("error", None)
+        write_json(root / "manifest.json", manifest)
+        summarize(root, manifest)
+        print(f"{'Prompts prepared' if dry_run else 'Audit complete'}: {root / 'SUMMARY.md'}", flush=True)
+
+
+def positive_integer(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
+
+
+def interrupt_run(signum, _frame):
+    raise KeyboardInterrupt(f"Interrupted by {signal.Signals(signum).name}")
+
+
+def main():
+    signal.signal(signal.SIGTERM, interrupt_run)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("repo", nargs="?", help="Git repository to audit at a committed revision")
+    parser.add_argument("--resume", type=Path, help="resume an existing run with its frozen settings")
+    parser.add_argument("--ref", help="revision to snapshot (default: HEAD; excludes uncommitted changes)")
+    parser.add_argument("--out", type=Path, help="new output directory, outside the target repository")
+    parser.add_argument("--context", type=Path, help="deployment, required behavior, and threat-model document")
+    parser.add_argument("--build-command", help="build command, run by /bin/sh in each source copy")
+    parser.add_argument("--test-command", help="project regression test command")
+    parser.add_argument("--black-box-command", help="black-box command; successful stdout must match exactly")
+    parser.add_argument("--model", help="Claude model; omitted to inherit the CLI default")
+    parser.add_argument("--claude-bin", help="Claude executable (default: claude)")
+    parser.add_argument("--timeout", type=positive_integer, help="seconds per subprocess (default: 1800)")
+    parser.add_argument("--max-turns", type=positive_integer, help="Claude turns per pass (default: 100)")
+    parser.add_argument("--dry-run", action="store_true", help="write prompts without invoking models or target code")
+    args = parser.parse_args()
+    root = None
+    manifest = None
+    try:
+        if args.resume:
+            overrides = [key for key, value in vars(args).items() if key not in ("resume", "dry_run") and value is not None]
+            if overrides:
+                raise AuditError("--resume uses saved settings; do not combine with " + ", ".join(overrides))
+            root = args.resume.expanduser().resolve()
+            manifest = read_json(root / "manifest.json")
+            if manifest.get("version") != VERSION or manifest.get("root") != str(root):
+                raise AuditError("Unsupported or relocated run manifest")
+        else:
+            if not args.repo:
+                parser.error("repo is required unless --resume is supplied")
+            repo = Path(git(Path(args.repo).expanduser().resolve(), "rev-parse", "--show-toplevel")).resolve()
+            commit = git(repo, "rev-parse", "--verify", "--end-of-options", (args.ref or "HEAD") + "^{commit}")
+            root = (args.out or repo.parent / f"{repo.name}-struct-{timestamp()}-{uuid.uuid4().hex[:6]}").expanduser().resolve()
+            if root.is_relative_to(repo):
+                raise AuditError("Output must be outside the target repository")
+            context = args.context.expanduser().read_text(encoding="utf-8") if args.context else ""
+            root.mkdir(parents=True, exist_ok=False)
+            manifest = {"version": VERSION, "root": str(root), "repo": str(repo), "commit": commit,
+                        "article": ARTICLE, "created": timestamp(), "status": "planned", "passes": {},
+                        "context": context, "build_command": args.build_command, "test_command": args.test_command,
+                        "black_box_command": args.black_box_command, "model": args.model,
+                        "claude_bin": str(Path(args.claude_bin).expanduser().resolve()) if args.claude_bin and "/" in args.claude_bin else args.claude_bin or "claude",
+                        "timeout": args.timeout or 1800, "max_turns": args.max_turns or 100}
+            write_json(root / "manifest.json", manifest)
+        print(f"Run: {root}\nCommitted revision only: {manifest['commit']}", flush=True)
+        run(root, manifest, args.dry_run)
+        return 0
+    except (AuditError, OSError, ValueError, KeyboardInterrupt) as exc:
+        print(f"struct: {str(exc) or 'interrupted'}", file=sys.stderr)
+        if root and manifest:
+            print(f"Resume with: {sys.argv[0]} --resume {str(root)!r}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
