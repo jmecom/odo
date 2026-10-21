@@ -45,6 +45,21 @@ observed = json.loads(response.stdout)
 assert observed["reached"] is True and observed["result"] == "ok", observed
 print("allowed request: ok")
 '''
+COMBINED_SERVICE = '''import json
+import sys
+import gate_a
+import gate_b
+
+request = sys.argv[1]
+denied = request.startswith("denied")
+guarded = {"denied-a": gate_a.GUARDED, "denied-b": gate_b.GUARDED}.get(request, False)
+if denied and guarded:
+    print(json.dumps({"reached": False, "trace": "gate rejected before sensitive", "result": "rejected"}))
+    raise SystemExit(0)
+result = "broken" if gate_a.GUARDED and gate_b.GUARDED else "ok"
+print(json.dumps({"reached": True, "trace": "service.sensitive entered", "result": result}))
+raise SystemExit(1 if denied else 0)
+'''
 
 # This fake follows the real CLI's structured-output interface. It generates a
 # genuine git patch and probes a subprocess in the runner's independent trees.
@@ -89,6 +104,8 @@ for spec in configuration.get("findings", {}).get(name, []):
     identifier = spec.get("id", "exposure")
     artifact_identifier = spec.get("artifact_id", identifier)
     mode = spec.get("mode", "nominal")
+    target = spec.get("target", "service.py")
+    negative_request = spec.get("negative_request", "denied")
     folder = artifacts / artifact_identifier
     folder.mkdir()
     probe_text = ''' + repr('''import json
@@ -100,11 +117,17 @@ import sys
 source = Path(os.environ["STRUCT_SOURCE"])
 kind = sys.argv[1]
 mode = MODE
+negative_request = NEGATIVE_REQUEST
 state = source / ".positive_ran"
+if mode == "pollute":
+    (source / "probe_was_here.txt").write_text("must never enter the production commit")
+if mode == "delivery-failure" and os.environ.get("STRUCT_TEST_FAIL_PROBE") == "1":
+    print("fresh delivery probe deliberately failed")
+    raise SystemExit(2)
 if mode == "contaminate" and kind == "negative" and state.exists():
     print(json.dumps({"reached": False, "trace": "prior positive case disabled the operation", "result": "rejected"}))
     raise SystemExit(0)
-observed = subprocess.run([sys.executable, str(source / "service.py"), "denied" if kind == "negative" else "allowed"], capture_output=True, text=True)
+observed = subprocess.run([sys.executable, str(source / "service.py"), negative_request if kind == "negative" else "allowed"], capture_output=True, text=True)
 if mode == "contaminate" and kind == "positive":
     state.write_text("state must not carry over to the negative check")
 if mode == "no-marker":
@@ -117,21 +140,23 @@ if mode == "positive-failure" and kind == "positive":
     raise SystemExit(2)
 raise SystemExit(observed.returncode)
 ''') + r'''
-    (folder / "probe.py").write_text(probe_text.replace("MODE", repr(mode)))
-    trace = subprocess.run([sys.executable, str(source / "service.py"), "denied"], capture_output=True, text=True)
+    (folder / "probe.py").write_text(probe_text.replace("MODE", repr(mode)).replace("NEGATIVE_REQUEST", repr(negative_request)))
+    trace = subprocess.run([sys.executable, str(source / "service.py"), negative_request], capture_output=True, text=True)
     (folder / "trace.json").write_text(trace.stdout)
-    original = (source / "service.py").read_text()
+    original = (source / target).read_text()
     patched = original.replace("GUARDED = False", "GUARDED = True")
+    if mode == "pollute":
+        patched += '\nTRAILING_SPACE = "kept" \t\n'
     if mode == "result-mismatch":
         patched = patched.replace('RESULT = "ok"', 'RESULT = "changed"')
     if mode == "bool-int":
         patched = patched.replace('RESULT = True', 'RESULT = 1')
     if mode == "contaminate":
         patched = original + "\n# Ineffective candidate: operation is still reachable.\n"
-    (source / "service.py").write_text(patched)
-    difference = subprocess.run(["git", "-C", str(source), "diff", "--", "service.py"], capture_output=True, text=True, check=True)
+    (source / target).write_text(patched)
+    difference = subprocess.run(["git", "-C", str(source), "diff", "--", target], capture_output=True, text=True, check=True)
     (folder / "gate.patch").write_text(difference.stdout)
-    (source / "service.py").write_text(original)
+    (source / target).write_text(original)
     evidence = [artifact_identifier + "/trace.json", artifact_identifier + "/probe.py"]
     if mode in ("escape-parent", "escape-symlink"):
         outside = artifacts.parent / "outside-evidence.txt"
@@ -155,7 +180,7 @@ raise SystemExit(observed.returncode)
         "source_locations": ["service.py:7"],
         "evidence": evidence,
         "negative_argv": [sys.executable, "{artifacts}/" + artifact_identifier + "/probe.py", "negative"],
-        "positive_argv": [sys.executable, "{artifacts}/" + artifact_identifier + "/probe.py", "positive"],
+        "positive_argv": [] if spec.get("no_positive") else [sys.executable, "{artifacts}/" + artifact_identifier + "/probe.py", "positive"],
         "limitations": ["One instrumented fixture and configuration only"],
     })
 
@@ -229,6 +254,10 @@ class StructBlackBoxTests(unittest.TestCase):
             "STRUCT_TEST_CONFIG": str(self.configuration),
             "STRUCT_TEST_LOG": str(self.log),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "GIT_AUTHOR_NAME": "Struct test",
+            "GIT_AUTHOR_EMAIL": "struct-test@example.invalid",
+            "GIT_COMMITTER_NAME": "Struct test",
+            "GIT_COMMITTER_EMAIL": "struct-test@example.invalid",
             "PATH": str(self.root) + os.pathsep + os.environ.get("PATH", ""),
         }
         self.python = shlex.quote(sys.executable)
@@ -272,6 +301,201 @@ class StructBlackBoxTests(unittest.TestCase):
 
     def finding_config(self, **finding):
         return {"findings": {PASSES[0]: [finding]}}
+
+    def delivery(self):
+        return json.loads((self.out / "delivery.json").read_text())
+
+    def git_at(self, repository, *args):
+        return subprocess.run(
+            ["git", "-C", str(repository), *args], env=self.env,
+            text=True, capture_output=True, check=True,
+        )
+
+    def frozen_evidence(self):
+        paths = [self.out / "manifest.json"]
+        for name in PASSES:
+            directory = self.out / "passes" / name
+            paths.append(directory / "result.json")
+            paths.extend(path for path in (directory / "artifacts").rglob("*") if path.is_file())
+        return {str(path.relative_to(self.out)): path.read_bytes() for path in paths}
+
+    def test_delivery_commits_exact_patch_without_probe_or_checkout_pollution(self):
+        (self.repo / "service.py").write_text(SERVICE + "\nUNCOMMITTED = True\n")
+        (self.repo / "untracked.txt").write_text("preserve original checkout")
+        original_status = self.git("status", "--porcelain").stdout
+        original_text = (self.repo / "service.py").read_text()
+        branch = "struct/exact-delivery"
+        self.assert_success(self.start(self.finding_config(mode="pollute"), extra=("--branch", branch)))
+
+        delivery = self.delivery()
+        self.assertEqual(delivery["status"], "completed")
+        self.assertEqual(delivery["selected"], [PASSES[0] + "/exposure"])
+        self.assertEqual(delivery["accepted_reviewed"], [])
+        self.assertEqual(delivery["branch"], branch)
+        source = Path(delivery["source"])
+        self.assertTrue(source.is_absolute())
+        self.assertTrue(source.is_relative_to((self.out / "deliveries").resolve()))
+        self.assertEqual(self.git_at(source, "rev-parse", "HEAD").stdout.strip(), delivery["commit"])
+        self.assertEqual(self.git_at(source, "rev-parse", "HEAD^").stdout.strip(), self.commit)
+        self.assertEqual(self.git_at(source, "symbolic-ref", "--short", "HEAD").stdout.strip(), branch)
+        expected = SERVICE.replace("GUARDED = False", "GUARDED = True") + '\nTRAILING_SPACE = "kept" \t\n'
+        self.assertEqual(self.git_at(source, "show", "HEAD:service.py").stdout, expected)
+        self.assertEqual(self.git_at(source, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines(),
+                         ["black_box.py", "project_tests.py", "service.py"])
+        self.assertEqual(self.git_at(source, "status", "--porcelain").stdout, "")
+        self.assertFalse((source / "probe_was_here.txt").exists())
+        self.assertFalse((source / "agent_was_here").exists())
+        self.assertFalse((source / "__pycache__").exists())
+        directory = source.parent
+        self.assertTrue((directory / "result.json").is_file())
+        self.assertTrue((directory / "verification").is_dir())
+        committed_diff = self.git_at(source, "diff", "--binary", "--full-index", self.commit, delivery["commit"]).stdout
+        self.assertEqual((directory / "changes.patch").read_text(), committed_diff)
+        self.assertIn('+TRAILING_SPACE = "kept" \t\n', committed_diff)
+        self.assertTrue(list((directory / "verification").rglob("probe_was_here.txt")),
+                        "the pollution control must actually run in disposable verifier sources")
+        self.assertEqual(self.git("status", "--porcelain").stdout, original_status)
+        self.assertEqual((self.repo / "service.py").read_text(), original_text)
+        self.assertEqual((self.repo / "untracked.txt").read_text(), "preserve original checkout")
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.commit)
+
+    def test_delivery_review_requires_acceptance_then_reuses_completed_audit(self):
+        identifier = PASSES[1] + "/early"
+        config = {"findings": {PASSES[1]: [{"id": "early"}]}}
+        self.assert_success(self.start(config))
+        self.assertEqual(self.outcome(PASSES[1], "early")["status"], "review-required")
+        self.assertEqual(self.delivery()["status"], "no-changes")
+        self.assertEqual(self.delivery()["selected"], [])
+        frozen = self.frozen_evidence()
+        arguments = ("--resume", self.out, "--accept-reviewed", identifier, "--branch", "struct/accepted")
+        self.assert_success(self.invoke(*arguments))
+        delivery = self.delivery()
+        self.assertEqual(delivery["status"], "completed")
+        self.assertEqual(delivery["selected"], [identifier])
+        self.assertEqual(delivery["accepted_reviewed"], [identifier])
+        attempts = list((self.out / "deliveries").iterdir())
+        self.assert_success(self.invoke(*arguments))
+        self.assertEqual(self.delivery()["commit"], delivery["commit"])
+        self.assertEqual(list((self.out / "deliveries").iterdir()), attempts)
+        self.assertEqual(self.frozen_evidence(), frozen)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_delivery_acceptance_cannot_waive_missing_or_failed_proof(self):
+        cases = (({"no_positive": True}, "reproduced"), ({"mode": "exit-two"}, "hypothesis"))
+        for specification, status in cases:
+            with self.subTest(status=status):
+                self.out = self.root / ("audit-unverified-" + status)
+                self.assert_success(self.start(self.finding_config(**specification)))
+                self.assertEqual(self.outcome()["status"], status)
+                before = self.frozen_evidence()
+                calls = len(self.calls())
+                result = self.invoke("--resume", self.out, "--accept-reviewed", PASSES[0] + "/exposure")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("acceptance cannot waive evidence", result.stderr)
+                self.assertFalse(self.delivery().get("commit"))
+                self.assertEqual(self.frozen_evidence(), before)
+                self.assertEqual(self.manifest()["status"], "completed")
+                self.assertEqual(len(self.calls()), calls)
+
+    def test_delivery_combined_regression_blocks_individually_verified_patches(self):
+        (self.repo / "service.py").write_text(COMBINED_SERVICE)
+        (self.repo / "gate_a.py").write_text("GUARDED = False\n")
+        (self.repo / "gate_b.py").write_text("GUARDED = False\n")
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "two independent gate controls")
+        self.commit = self.git("rev-parse", "HEAD").stdout.strip()
+        config = {"findings": {PASSES[0]: [
+            {"id": "first", "target": "gate_a.py", "negative_request": "denied-a"},
+            {"id": "second", "target": "gate_b.py", "negative_request": "denied-b"},
+        ]}}
+        result = self.start(config, extra=("--branch", "struct/incompatible"))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.manifest()["status"], "completed")
+        for identifier in ("first", "second"):
+            self.assertEqual(self.outcome(identifier=identifier)["status"], "verified")
+            self.assertIs(self.outcome(identifier=identifier)["replay_passed"], True)
+        delivery = self.delivery()
+        self.assertEqual(delivery["status"], "failed")
+        self.assertFalse(delivery.get("commit"))
+        source = Path(delivery["source"])
+        self.assertEqual(self.git_at(source, "rev-parse", "HEAD").stdout.strip(), self.commit)
+        self.assertEqual((source / "gate_a.py").read_text(), "GUARDED = True\n")
+        self.assertEqual((source / "gate_b.py").read_text(), "GUARDED = True\n")
+        logs = "\n".join(path.read_text() for path in (source.parent / "verification").rglob("*.log"))
+        self.assertIn("broken", logs, "failure must come from the combined behavior, not patch application")
+        self.assertIn("Combined validation failed", result.stderr)
+        frozen = self.frozen_evidence()
+        self.assertNotEqual(self.invoke("--resume", self.out).returncode, 0)
+        self.assertEqual(self.frozen_evidence(), frozen)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_delivery_replays_controls_instead_of_trusting_old_success(self):
+        identifier = PASSES[1] + "/early"
+        self.assert_success(self.start({"findings": {PASSES[1]: [{"id": "early", "mode": "delivery-failure"}]}}))
+        self.assertIs(self.outcome(PASSES[1], "early")["replay_passed"], True)
+        frozen = self.frozen_evidence()
+        self.env["STRUCT_TEST_FAIL_PROBE"] = "1"
+        result = self.invoke("--resume", self.out, "--accept-reviewed", identifier)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.delivery()["status"], "failed")
+        self.assertFalse(self.delivery().get("commit"))
+        self.assertEqual(self.frozen_evidence(), frozen)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_delivery_refuses_tampered_discovery_artifacts(self):
+        self.assert_success(self.start(self.finding_config(), extra=("--branch", "struct/tamper")))
+        original_delivery = self.delivery()
+        manifest = (self.out / "manifest.json").read_bytes()
+        patch = self.out / "passes" / PASSES[0] / "artifacts" / "exposure" / "gate.patch"
+        patch.write_text(patch.read_text() + "\nchanged after completed replay\n")
+        result = self.invoke("--resume", self.out)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Completed evidence changed", result.stderr)
+        self.assertEqual(self.delivery()["commit"], original_delivery["commit"])
+        self.assertEqual((self.out / "manifest.json").read_bytes(), manifest)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_delivery_reuse_refuses_tampered_verification_logs(self):
+        self.assert_success(self.start(self.finding_config()))
+        delivery = self.delivery()
+        frozen = self.frozen_evidence()
+        directory = Path(delivery["source"]).parent
+        logs = list((directory / "verification").rglob("*.stdout.log"))
+        self.assertTrue(logs)
+        logs[0].write_text("changed after successful combined validation\n")
+        result = self.invoke("--resume", self.out)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Completed delivery changed", result.stderr)
+        self.assertEqual(self.delivery()["commit"], delivery["commit"])
+        self.assertEqual(self.frozen_evidence(), frozen)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_delivery_failed_publication_can_retry_same_commit_to_local_bare_repo(self):
+        remote = self.root / "published.git"
+        branch = "struct/published"
+        first = self.start(self.finding_config(), extra=("--branch", branch, "--push", remote))
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        retry_line = next(line for line in first.stderr.splitlines() if line.startswith("Resume with: "))
+        retry = shlex.split(retry_line.removeprefix("Resume with: "))
+        self.assertIn("--push", retry)
+        self.assertEqual(Path(retry[retry.index("--push") + 1]).resolve(), remote.resolve())
+        delivery = self.delivery()
+        self.assertEqual(delivery["status"], "completed")
+        self.assertEqual(delivery["publication"]["status"], "failed")
+        self.assertEqual(self.manifest()["status"], "completed")
+        frozen = self.frozen_evidence()
+        attempts = list((self.out / "deliveries").iterdir())
+        remote.mkdir()
+        self.git_at(remote, "init", "--quiet", "--bare")
+        self.assert_success(self.invoke("--resume", self.out, "--branch", branch, "--push", remote))
+        self.assertEqual(self.delivery()["status"], "completed")
+        self.assertEqual(self.delivery()["commit"], delivery["commit"])
+        self.assertEqual(self.git_at(remote, "rev-parse", "refs/heads/" + branch).stdout.strip(), delivery["commit"])
+        self.assertEqual(self.git_at(remote, "show", "refs/heads/" + branch + ":service.py").stdout,
+                         SERVICE.replace("GUARDED = False", "GUARDED = True"))
+        self.assertEqual(list((self.out / "deliveries").iterdir()), attempts)
+        self.assertEqual(self.frozen_evidence(), frozen)
+        self.assertEqual(len(self.calls()), 3)
 
     def test_codex_defaults_to_astra_and_replays_the_finding(self):
         self.assert_success(self.start(self.finding_config(), codex=True))
@@ -326,6 +550,11 @@ class StructBlackBoxTests(unittest.TestCase):
         identifier_schema = schema["properties"]["findings"]["items"]["properties"]["id"]
         self.assertEqual(identifier_schema["pattern"], r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
         self.assertEqual(self.manifest()["status"], "completed")
+        delivery = self.delivery()
+        self.assertEqual(delivery["status"], "completed")
+        self.assertEqual(delivery["selected"], [PASSES[0] + "/F01", PASSES[0] + "/H01"])
+        self.assertEqual(self.git_at(delivery["source"], "show", "HEAD:service.py").stdout,
+                         SERVICE.replace("GUARDED = False", "GUARDED = True"))
 
     def test_case_only_finding_id_collisions_are_rejected_before_replay(self):
         config = {"findings": {PASSES[0]: [

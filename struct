@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -41,15 +42,17 @@ supported non-default behavior changes or its preservation is uncertain.""",
 protocol-state gate across supported configurations: parsing, decompression,
 verification, allocation, callbacks, or state changes. Identify the actual value
 that selects the implementation, including embedded types and nested objects.
-Propose earlier checks or state guards. Record any unavoidable minimal parsing
+Implement defensible earlier checks or state guards as independent candidate
+patches. Record any unavoidable minimal parsing
 needed to authenticate; do not assume all parsing can move after authentication.
 These proposals require human review even if a candidate patch passes tests.""",
     "03-configuration-interactions": """Find accepted configuration combinations
 that silently disable, bypass, or weaken a security control. Trace defaults,
 aliases, namespaces, precedence, endpoint overrides, build flags, and reloads to
 runtime enforcement. Prioritize settings sharing a control; pairwise testing is
-not exhaustive. Reproduce contradictory combinations and propose explicit
-configuration rejection or consistent enforcement. Changes require human review.""",
+not exhaustive. Reproduce contradictory combinations and implement defensible
+configuration rejection or consistent enforcement as independent candidate
+patches. Changes require human review.""",
 }
 TEXT_FIELDS = ("id", "title", "entry_point", "sensitive_operation", "expected_gate",
                "configuration", "rationale", "recommendation", "patch", "behavior_change")
@@ -108,11 +111,11 @@ def digest(path):
         return checksum.hexdigest()
 
 
-def git(repo, *args):
+def git(repo, *args, strip=True):
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
     if result.returncode:
         raise AuditError(result.stderr.strip() or f"git {args[0]} failed")
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def stop_process(process):
@@ -287,9 +290,14 @@ against the pinned commit. All instrumentation and added regression probes stay
 in artifacts, separate from the production patch. Inspect every identified route
 to the operation. Document impact on supported non-default configurations;
 behavior_change=none requires evidence, otherwise use nondefault or unknown.
-Other passes propose changes, optionally with a candidate patch. Do not combine
-findings into dependent patches. You may edit this disposable source copy to
-construct a patch, but the runner independently replays against the pinned base.
+For the other passes, implement an independent candidate patch when the intended
+policy and available evidence support one. A recommendation alone is not the
+deliverable for a defensible change: the runner will assemble eligible patches
+into changed source, validate their combination, and commit it on a named branch.
+Leave patch empty when intent or evidence is unresolved and explain the blocker.
+Do not combine findings into dependent patches. You may edit this disposable
+source copy to construct a patch, but the runner independently replays against
+the pinned base.
 Do not commit, push, contact external systems, or modify the original repository.
 
 Return the requested structured JSON. inventory and configurations are arrays of
@@ -330,24 +338,35 @@ def check_command(command, source, log, timeout):
     return execute(["/bin/sh", "-c", command], source, log, timeout)
 
 
-def verify_finding(root, name, finding, artifacts, manifest):
-    directory = root / "verification" / name / finding["id"]
+def verify_finding(root, name, finding, artifacts, manifest, *, directory=None, patches=None, expected_tree=None):
+    directory = directory or root / "verification" / name / finding["id"]
     directory.mkdir(parents=True)
     outcome = {"status": "hypothesis", "checks": {}, "limitations": []}
     checks, limitations = outcome["checks"], outcome["limitations"]
     timeout = manifest["timeout"]
+    initial_trees = {}
+
+    def unchanged(tree):
+        if expected_tree is not None and (git(tree, "write-tree") != initial_trees[str(tree)]
+                                          or git(tree, "diff", "--binary")):
+            raise AuditError(f"Verification changed production source in {tree.name}.")
 
     def command(label, command_text, tree):
         checks[label] = check_command(command_text, tree, directory / f"{label}.stdout.log", timeout)
+        unchanged(tree)
         return checks[label]["exit_code"] == 0
 
     def prepare(label, patched=False):
         tree = directory / label
         clone(root / "snapshot", tree, manifest["commit"])
         if patched:
-            patch = artifact_path(artifacts, finding["patch"])
-            git(tree, "apply", "--check", "--", str(patch))
-            git(tree, "apply", "--", str(patch))
+            for patch in patches if patches is not None else [artifact_path(artifacts, finding["patch"])]:
+                git(tree, "apply", "--check", "--", str(patch))
+                git(tree, "apply", *(["--index"] if expected_tree is not None else []), "--", str(patch))
+        if expected_tree is not None:
+            initial_trees[str(tree)] = git(tree, "write-tree")
+            if patched and initial_trees[str(tree)] != expected_tree:
+                raise AuditError("Replay source differs from the assembled production tree.")
         if manifest["build_command"] and not command(f"{label}-build", manifest["build_command"], tree):
             raise AuditError(f"{label} build failed.")
         return tree
@@ -357,6 +376,7 @@ def verify_finding(root, name, finding, artifacts, manifest):
         # test suite, or instrumentation must not influence a negative case.
         tree = prepare(label + "-source", patched)
         checks[label] = probe(argv, tree, artifacts, directory / f"{label}.stdout.log", timeout)
+        unchanged(tree)
         result = checks[label]
         return result["exit_code"] == exit_code and result.get("probe", {}).get("reached") is reached
 
@@ -411,6 +431,19 @@ def summarize(root, manifest):
              "Verified means the recorded replay checks passed. It does not establish that the repository is secure.", ""]
     if manifest.get("error"):
         lines.extend([f"Run error: {manifest['error']}", ""])
+    if (root / "delivery.json").exists():
+        delivery = read_json(root / "delivery.json")
+        lines.extend(["## Changed source", "", f"Delivery: **{delivery['status']}**", ""])
+        if delivery.get("commit"):
+            lines.extend([f"Branch: `{delivery['branch']}`", f"Commit: `{delivery['commit']}`",
+                          f"Source: `{delivery['source']}`", ""])
+        if delivery.get("error"):
+            lines.extend([delivery["error"], ""])
+        if delivery.get("held"):
+            lines.extend(["Not included:", "", *[f"- {item}" for item in delivery["held"]], ""])
+        if delivery.get("publication"):
+            lines.extend([f"Publication: {delivery['publication']['status']}", ""])
+        lines.extend(["Delivery decisions and combined validation: `delivery.json`", ""])
     for name, state in manifest["passes"].items():
         lines.extend([f"## {name}", "", f"State: {state['status']}", ""])
         if state["status"] != "completed":
@@ -434,7 +467,7 @@ def summarize(root, manifest):
 
 
 @contextmanager
-def lock_run(root, manifest):
+def lock_run(root, manifest, *, audit=True):
     with (root / ".lock").open("a") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -443,6 +476,8 @@ def lock_run(root, manifest):
         try:
             yield
         except (AuditError, OSError, ValueError, KeyboardInterrupt) as exc:
+            if not audit:
+                raise
             manifest["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             manifest["error"] = str(exc) or "Interrupted"
             for state in manifest["passes"].values():
@@ -454,6 +489,190 @@ def lock_run(root, manifest):
             except (AuditError, KeyError, TypeError):
                 (root / "SUMMARY.md").write_text(f"# Struct audit failed\n\n{manifest['error']}\n", encoding="utf-8")
             raise
+
+
+def completed_findings(root, manifest):
+    """Check sealed discovery evidence before using it to change source."""
+    findings = []
+    for name in PASSES:
+        state = manifest["passes"].get(name, {})
+        if state.get("status") != "completed":
+            raise AuditError("Delivery requires all three audit passes to be completed.")
+        directory = root / "passes" / name
+        artifacts = directory / "artifacts"
+        result = validate_result(read_json(directory / "result.json"), artifacts)
+        if state["result_hash"] != digest(directory / "result.json") or state["artifacts"] != fingerprints(artifacts):
+            raise AuditError(f"Completed evidence changed for {name}; start a new run.")
+        for finding in result["findings"]:
+            findings.append((name, finding, artifacts, state["outcomes"].get(finding["id"], {})))
+    if (git(root / "snapshot", "rev-parse", "HEAD") != manifest["commit"]
+            or git(root / "snapshot", "status", "--porcelain")):
+        raise AuditError("Pinned snapshot changed; start a new run.")
+    return findings
+
+
+def verification_fingerprints(directory):
+    # Seal replay outputs, not disposable compiler caches or cloned Git databases.
+    outputs = {}
+    for path in sorted(directory.glob("*/*/*")):
+        if path.is_symlink():
+            raise AuditError(f"Verification output symlink is not supported: {path}")
+        if path.is_file():
+            outputs[str(path.relative_to(directory))] = digest(path)
+    return outputs
+
+
+def deliver(root, manifest, *, accepted=None, branch=None, remote=None):
+    """Materialize and freshly validate changes without rewriting audit evidence."""
+    with lock_run(root, manifest, audit=False):
+        findings = completed_findings(root, manifest)
+        previous = read_json(root / "delivery.json") if (root / "delivery.json").exists() else {}
+        accepted = sorted(set(accepted if accepted is not None else previous.get("accepted_reviewed", [])))
+        known = {f"{name}/{finding['id']}": (finding, outcome) for name, finding, _, outcome in findings}
+        for identifier in accepted:
+            if identifier not in known:
+                raise AuditError(f"Unknown reviewed finding: {identifier}; use PASS/ID.")
+            finding, outcome = known[identifier]
+            if outcome.get("status") != "review-required" or outcome.get("replay_passed") is not True:
+                raise AuditError(f"{identifier} is not a fully replayed review-required change; acceptance cannot waive evidence.")
+        selected, held = [], []
+        for name, finding, artifacts, outcome in findings:
+            identifier = f"{name}/{finding['id']}"
+            automatic = (name == "01-default-exposure" and finding["behavior_change"] == "none"
+                         and outcome.get("status") == "verified" and outcome.get("replay_passed") is True)
+            if automatic or identifier in accepted:
+                if not (finding["patch"] and finding["negative_argv"] and finding["positive_argv"]
+                        and manifest["test_command"] and manifest["black_box_command"]):
+                    raise AuditError(f"{identifier} lacks required patch, probes, or regression commands.")
+                selected.append((name, finding, artifacts, outcome))
+            else:
+                reason = "needs --accept-reviewed after review" if outcome.get("status") == "review-required" else "insufficient verification"
+                held.append(f"{identifier}: {reason}")
+        if not selected:
+            if remote:
+                raise AuditError("No eligible changes to publish.")
+            state = {"status": "no-changes", "selected": [], "accepted_reviewed": accepted, "held": held}
+            write_json(root / "delivery.json", state)
+            summarize(root, manifest)
+            print("No transformed branch: no eligible changes were selected. See delivery.json.", flush=True)
+            return
+        branch = branch or previous.get("branch") or f"struct/reduction-{timestamp()}-{uuid.uuid4().hex[:6]}"
+        if branch.startswith("-"):
+            raise AuditError("Delivery branch cannot start with a dash.")
+        git(root / "snapshot", "check-ref-format", "refs/heads/" + branch)
+        if remote and "/" not in remote and ":" not in remote:
+            raise AuditError("--push requires an explicit remote URL or filesystem path, not a remote name.")
+        if remote and ":" not in remote:
+            remote = str(Path(remote).expanduser().resolve())
+        request = {"commit": manifest["commit"], "branch": branch, "accepted_reviewed": accepted,
+                   "selected": [f"{name}/{finding['id']}" for name, finding, _, _ in selected],
+                   "evidence": {name: {"result_hash": manifest["passes"][name]["result_hash"],
+                                       "artifacts": manifest["passes"][name]["artifacts"]} for name in PASSES},
+                   "commands": {key: manifest[key] for key in ("build_command", "test_command", "black_box_command", "timeout")}}
+        request_hash = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+
+        def save(state):
+            if state.get("directory"):
+                write_json(Path(state["directory"]) / "result.json", state)
+            write_json(root / "delivery.json", state)
+            summarize(root, manifest)
+
+        def publish(state):
+            if not remote:
+                return
+            state["publication"] = {"status": "running", "remote": remote}
+            save(state)
+            try:
+                # Never infer origin: this clone's origin is the pinned snapshot.
+                log = Path(state["directory"]) / f"publish-{timestamp()}-{uuid.uuid4().hex[:6]}.stdout.log"
+                command = execute(["git", "-C", state["source"], "push", "--", remote,
+                                   f"{state['commit']}:refs/heads/{state['branch']}"], Path(state["source"]),
+                                  log, manifest["timeout"])
+                state["publication"]["command"] = command
+                if command["exit_code"] != 0:
+                    raise AuditError(f"Publication failed; inspect {command['stderr']}")
+            except (AuditError, OSError, KeyboardInterrupt) as exc:
+                state["publication"].update(status="failed", error=str(exc) or "Interrupted")
+                save(state)
+                raise
+            state["publication"]["status"] = "completed"
+            save(state)
+
+        if previous.get("status") == "completed" and previous.get("request_hash") == request_hash:
+            source = Path(previous["source"])
+            directory = Path(previous["directory"])
+            if (git(source, "rev-parse", "HEAD") != previous["commit"]
+                    or git(source, "symbolic-ref", "--short", "HEAD") != branch
+                    or git(source, "status", "--porcelain")
+                    or digest(directory / "changes.patch") != previous["patch_hash"]
+                    or verification_fingerprints(directory / "verification") != previous["verification_hashes"]):
+                raise AuditError("Completed delivery changed; preserve it and choose a new --branch for a fresh delivery.")
+            publish(previous)
+            print(f"Changed source already delivered: {source} ({branch}, {previous['commit'][:12]})", flush=True)
+            if previous.get("publication", {}).get("status") in ("failed", "running"):
+                print("Publication has not succeeded; supply --push URL_OR_PATH to retry.", flush=True)
+            return
+
+        directory = root / "deliveries" / f"{timestamp()}-{uuid.uuid4().hex[:6]}"
+        directory.mkdir(parents=True)
+        source = directory / "source"
+        state = {"status": "running", "directory": str(directory), "source": str(source),
+                 "base_commit": manifest["commit"], "branch": branch, "selected": request["selected"],
+                 "accepted_reviewed": accepted, "held": held, "request": request, "request_hash": request_hash,
+                 "runner_hash": digest(Path(__file__).resolve()), "outcomes": {}}
+        save(state)
+        try:
+            clone(root / "snapshot", source, manifest["commit"])
+            git(source, "checkout", "--quiet", "-b", branch)
+            applied = set()
+            for _, finding, artifacts, _ in selected:
+                patch = artifact_path(artifacts, finding["patch"])
+                patch_hash = digest(patch)
+                if patch_hash not in applied:
+                    git(source, "apply", "--index", "--check", "--", str(patch))
+                    git(source, "apply", "--index", "--", str(patch))
+                    applied.add(patch_hash)
+            combined = git(source, "diff", "--cached", "--binary", "--full-index", strip=False)
+            if not combined:
+                raise AuditError("Selected patches produced no source changes.")
+            patch = directory / "changes.patch"
+            patch.write_text(combined, encoding="utf-8")
+            state["patch_hash"] = digest(patch)
+            state["tree"] = git(source, "write-tree")
+            save(state)
+            for name, finding, artifacts, _ in selected:
+                identifier = f"{name}/{finding['id']}"
+                print(f"  validating combined changes for {identifier}", flush=True)
+                outcome = verify_finding(root, name, finding, artifacts, manifest,
+                                         directory=directory / "verification" / name / finding["id"],
+                                         patches=[patch], expected_tree=state["tree"])
+                state["outcomes"][identifier] = outcome
+                save(state)
+                # Fresh checks, rather than saved outcome flags, establish delivery.
+                completed_findings(root, manifest)
+                if digest(patch) != state["patch_hash"]:
+                    raise AuditError("Combined verification modified the production patch.")
+                if outcome.get("replay_passed") is not True:
+                    raise AuditError(f"Combined validation failed for {identifier}: {'; '.join(outcome['limitations'])}")
+            if (git(source, "write-tree") != state["tree"] or git(source, "diff", "--binary")
+                    or git(source, "ls-files", "--others", "--exclude-standard")):
+                raise AuditError("Assembly source changed during verification; refusing to commit.")
+            git(source, "commit", "--quiet", "-m", "Reduce unnecessary attack surface",
+                "-m", "Validated changes: " + ", ".join(state["selected"]))
+            commit = git(source, "rev-parse", "HEAD")
+            if (git(source, "rev-parse", "HEAD^{tree}") != state["tree"]
+                    or git(source, "rev-parse", "HEAD^") != manifest["commit"]
+                    or git(source, "status", "--porcelain")):
+                raise AuditError("Committed source differs from the validated tree.")
+            state.update(status="completed", commit=commit,
+                         verification_hashes=verification_fingerprints(directory / "verification"))
+            save(state)
+        except (AuditError, OSError, ValueError, KeyboardInterrupt) as exc:
+            state.update(status="failed", error=str(exc) or "Interrupted")
+            save(state)
+            raise
+        publish(state)
+        print(f"Changed source delivered: {source} ({branch}, {commit[:12]})", flush=True)
 
 
 def audit_pass(name, manifest, directory, prompt):
@@ -603,12 +822,17 @@ def main():
     parser.add_argument("--timeout", type=positive_integer, help="seconds per subprocess (default: 1800)")
     parser.add_argument("--max-turns", type=positive_integer, help="Claude turns per pass (default: 100)")
     parser.add_argument("--dry-run", action="store_true", help="write prompts without invoking models or target code")
+    parser.add_argument("--accept-reviewed", action="append", metavar="PASS/ID",
+                        help="include this fully replayed review-required patch in delivery (repeatable)")
+    parser.add_argument("--branch", help="name for the changed-source delivery branch")
+    parser.add_argument("--push", metavar="URL_OR_PATH", help="publish the validated commit to this explicit remote; never force")
     args = parser.parse_args()
     root = None
     manifest = None
     try:
         if args.resume:
-            overrides = [key for key, value in vars(args).items() if key not in ("resume", "dry_run") and value is not None]
+            overrides = [key for key, value in vars(args).items()
+                         if key not in ("resume", "dry_run", "accept_reviewed", "branch", "push") and value is not None]
             if overrides:
                 raise AuditError("--resume uses saved settings; do not combine with " + ", ".join(overrides))
             root = args.resume.expanduser().resolve()
@@ -644,12 +868,23 @@ def main():
                         "timeout": args.timeout or 1800, "max_turns": args.max_turns or 100}
             write_json(root / "manifest.json", manifest)
         print(f"Run: {root}\nCommitted revision only: {manifest['commit']}", flush=True)
-        run(root, manifest, args.dry_run)
+        # Completed discovery evidence is frozen. Delivery validates it under its
+        # own failure policy instead of changing a completed audit's status.
+        if not (args.resume and manifest.get("status") == "completed" and not args.dry_run):
+            run(root, manifest, args.dry_run)
+        if not args.dry_run:
+            deliver(root, manifest, accepted=args.accept_reviewed, branch=args.branch, remote=args.push)
         return 0
     except (AuditError, OSError, ValueError, KeyboardInterrupt) as exc:
         print(f"struct: {str(exc) or 'interrupted'}", file=sys.stderr)
         if root and manifest:
-            print(f"Resume with: {sys.argv[0]} --resume {str(root)!r}", file=sys.stderr)
+            retry = [sys.argv[0], "--resume", str(root)]
+            for identifier in args.accept_reviewed or []:
+                retry.extend(["--accept-reviewed", identifier])
+            for option, value in (("--branch", args.branch), ("--push", args.push)):
+                if value is not None:
+                    retry.extend([option, value])
+            print(f"Resume with: {shlex.join(retry)}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
 
 
